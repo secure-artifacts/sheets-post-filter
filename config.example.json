@@ -1,0 +1,23 @@
+{
+  "credentials_file": "C:\\Users\\Alienware\\inspiration-finder\\credentials.json",
+  "config_url": "",
+  "target_url": "",
+  "sources": [],
+  "source_urls": [],
+  "spreadsheet_id": "",
+  "database_sheet": "数据库",
+  "date_sheet": "",
+  "date_start_cell": "A1",
+  "date_end_cell": "B1",
+  "output_sheet": "筛选结果",
+  "output_start_row": 1,
+  "include_headers": true,
+  "add_source_column": true,
+  "exclude_id_value": "未找到",
+  "date_field": "发布日期",
+  "id_field": "帖文id",
+  "sort_field": "点赞",
+  "sort_descending": true,
+  "start_date": "",
+  "end_date": ""
+}

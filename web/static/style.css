@@ -1,0 +1,333 @@
+:root {
+  --ink: #1b241c;
+  --muted: #5d6a5e;
+  --paper: #f3efe4;
+  --card: #fffdf8;
+  --line: #d7d0c2;
+  --head: #1e3a32;
+  --accent: #c45c26;
+  --ok: #2f7d4a;
+  --bad: #a33b2b;
+  --log: #141a16;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font: 15px/1.5 "Segoe UI", "Microsoft YaHei UI", sans-serif;
+}
+
+.top {
+  background: var(--head);
+  color: #f4efe4;
+  padding: 22px 28px 20px;
+  display: flex;
+  justify-content: space-between;
+  gap: 24px;
+  align-items: flex-end;
+  flex-wrap: wrap;
+}
+
+.top h1 {
+  margin: 0 0 4px;
+  font-size: 26px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+}
+
+.top p {
+  margin: 0;
+  color: #c9d5cc;
+  font-size: 13px;
+}
+
+.sa {
+  background: #163028;
+  border: 1px solid #2c5248;
+  padding: 10px 12px;
+  min-width: min(520px, 100%);
+}
+
+.sa-label {
+  display: block;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: #9bb5ab;
+  margin-bottom: 4px;
+}
+
+.sa code {
+  display: block;
+  font-size: 12px;
+  color: #e8d39a;
+  word-break: break-all;
+  margin-bottom: 8px;
+}
+
+.tabs {
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 16px 18px 0;
+  display: flex;
+  gap: 8px;
+}
+
+.tab {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  padding: 8px 16px;
+}
+
+.tab.on {
+  background: var(--head);
+  border-color: var(--head);
+  color: #f4efe4;
+}
+
+.dest-box {
+  padding: 4px 0;
+}
+
+main {
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 22px 18px 48px;
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  padding: 16px 18px 18px;
+  margin-bottom: 14px;
+}
+
+.card h2 {
+  margin: 0 0 12px;
+  font-size: 16px;
+  font-weight: 650;
+}
+
+.card h2 em {
+  font-style: normal;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 500;
+  margin-left: 8px;
+}
+
+.note {
+  margin: -4px 0 12px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+label {
+  display: block;
+  font-size: 13px;
+  color: var(--muted);
+  margin-bottom: 10px;
+}
+
+input[type="text"],
+input[type="number"],
+input[type="date"],
+textarea {
+  display: block;
+  width: 100%;
+  margin-top: 5px;
+  padding: 9px 10px;
+  border: 1px solid #cfc6b6;
+  background: #fff;
+  color: var(--ink);
+  font: 14px/1.4 Consolas, "Cascadia Mono", "Microsoft YaHei UI", monospace;
+}
+
+textarea { min-height: 140px; resize: vertical; }
+
+input:focus, textarea:focus {
+  outline: 2px solid #1e3a32;
+  outline-offset: 1px;
+}
+
+.row3 {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--ink);
+  margin: 4px 0 0;
+}
+
+.check input { width: auto; margin: 0; }
+
+.hint-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  color: var(--muted);
+  font-size: 12px;
+  margin: -4px 0 10px;
+}
+
+.actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 8px 0 16px;
+}
+
+button, .linkbtn {
+  border: 1px solid transparent;
+  cursor: pointer;
+  padding: 10px 16px;
+  font: 14px/1 "Microsoft YaHei UI", "Segoe UI", sans-serif;
+}
+
+.primary {
+  background: var(--accent);
+  color: #fff;
+  min-width: 140px;
+}
+
+.primary:hover { filter: brightness(1.05); }
+.primary:disabled { opacity: 0.55; cursor: not-allowed; }
+
+.ghost, .linkbtn {
+  background: transparent;
+  border-color: #b9b09f;
+  color: var(--ink);
+  text-decoration: none;
+}
+
+.top .ghost {
+  color: #f4efe4;
+  border-color: #4d7368;
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+.collapse-btn {
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--muted);
+}
+
+.more { margin-top: 12px; }
+
+.split {
+  border: 0;
+  border-top: 1px solid var(--line);
+  margin: 14px 0;
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.btn-slot {
+  display: flex;
+  align-items: flex-end;
+  padding-bottom: 10px;
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.chips span {
+  background: #eef3ea;
+  border: 1px solid #c9d6c4;
+  color: #1e3a32;
+  padding: 3px 8px;
+  font-size: 12px;
+}
+
+.src-table { margin: 8px 0 10px; }
+.src-head, .src-row {
+  display: grid;
+  grid-template-columns: 140px 1fr 64px;
+  gap: 8px;
+  align-items: center;
+}
+.src-head {
+  color: var(--muted);
+  font-size: 12px;
+  padding: 0 0 6px;
+}
+.src-row { margin-bottom: 6px; }
+.src-row input { margin: 0; }
+.src-row .src-del { padding: 8px 8px; }
+
+.field-table { margin: 8px 0 10px; }
+.field-head, .field-row {
+  display: grid;
+  grid-template-columns: 140px 140px 1fr 64px;
+  gap: 8px;
+  align-items: center;
+}
+.field-head {
+  color: var(--muted);
+  font-size: 12px;
+  padding: 0 0 6px;
+}
+.field-row { margin-bottom: 6px; }
+.field-row input { margin: 0; }
+
+.log-card { background: var(--log); color: #d7e3d6; border-color: #0f1411; }
+
+.log-card h2 { color: #f3efe4; margin: 0; }
+
+.log-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.log {
+  margin: 0;
+  min-height: 180px;
+  max-height: 360px;
+  overflow: auto;
+  font: 12px/1.55 Consolas, "Cascadia Mono", monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.summary {
+  margin: 10px 0 0;
+  color: #e8d39a;
+  font-size: 13px;
+}
+
+.badge {
+  font-size: 11px;
+  padding: 3px 8px;
+  border: 1px solid #3a4a3c;
+  letter-spacing: 0.06em;
+}
+
+.badge.idle { color: #9aa89b; }
+.badge.run { color: #e8d39a; border-color: #8a6a28; }
+.badge.ok { color: #8fd49e; border-color: #2f7d4a; }
+.badge.bad { color: #f0a396; border-color: #a33b2b; }
+
+@media (max-width: 720px) {
+  .row3 { grid-template-columns: 1fr; }
+  .top { align-items: flex-start; }
+}
