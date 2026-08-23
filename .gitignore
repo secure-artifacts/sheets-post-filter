@@ -14,3 +14,6 @@ credentials.json
 Thumbs.db
 .idea/
 .vscode/
+build/
+dist/
+*.spec

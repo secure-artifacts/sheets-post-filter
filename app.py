@@ -10,6 +10,7 @@ from datetime import date, datetime, timedelta
 from flask import Flask, jsonify, render_template, request
 
 from fetch_posts import (
+    RESOURCE_DIR,
     SCRIPT_DIR,
     DEFAULT_FIELDS,
     Config,
@@ -31,8 +32,8 @@ from fetch_posts import (
 
 app = Flask(
     __name__,
-    template_folder=str(SCRIPT_DIR / "web"),
-    static_folder=str(SCRIPT_DIR / "web" / "static"),
+    template_folder=str(RESOURCE_DIR / "web"),
+    static_folder=str(RESOURCE_DIR / "web" / "static"),
 )
 
 _job_lock = threading.Lock()

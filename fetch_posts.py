@@ -21,7 +21,14 @@ from datetime import datetime, timedelta, date, time
 from pathlib import Path
 from typing import Any, Callable
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+RESOURCE_DIR = Path(__file__).resolve().parent
+# PyInstaller 单文件程序会把随包资源解压到临时目录；用户配置和同步状态
+# 必须保存在可执行文件旁边，不能写入该临时目录。
+SCRIPT_DIR = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else RESOURCE_DIR
+)
 STATE_FILE = SCRIPT_DIR / "sync_state.json"
 SHEETS_EPOCH = datetime(1899, 12, 30)
 SCOPES = [

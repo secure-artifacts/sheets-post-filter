@@ -1,4 +1,4 @@
-# 数据汇总
+# 数据汇总工具
 
 从多张 Google 表格按字段抓取贴文、按日期/点赞筛选，并支持按表头对齐同步。
 
@@ -29,6 +29,12 @@ python app.py
 - **表头对齐同步**：只填源表链接和工作表名，按规范表头对齐拷贝，缺列留空。
 - 两套功能各自支持定时同步（需保持本程序运行）。
 
-## 审核类型
+## 打包发布
 
-本仓库为本地 Python 脚本（无独立构建产物），按平台规范以 **源码审核** 提交。
+推送 `v*` 格式的 tag 后，GitHub Actions 会：
+
+1. 使用 PyInstaller 构建 `data-summary-tool-windows.exe`；
+2. 为最终 EXE 生成 GitHub Artifact Attestation；
+3. 使用默认 `GITHUB_TOKEN` 创建 Release 并上传同一个 EXE。
+
+请勿在 GitHub 网页中手工上传或替换 Release 产物，否则上传者和构件摘要将无法通过 L2 Attestation 校验。
