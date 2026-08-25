@@ -28,7 +28,7 @@ RestartApplications=no
 MinVersion=10.0
 
 [Languages]
-Name: "chinesesimp"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+Name: "chinesesimp"; MessagesFile: "installer-ChineseSimplified.isl"
 
 [Files]
 Source: "release\data-summary-tool\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
