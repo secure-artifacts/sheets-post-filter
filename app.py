@@ -755,8 +755,11 @@ def api_peek_headers():
             ),
             header_row=int(data.get("header_row") or cfg.align_header_row or 1),
         )
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception:
+        # 详细异常只留在本机控制台，避免把路径、Google API 响应或内部
+        # 实现信息通过 HTTP 接口返回给调用者（CWE-209 / CWE-497）。
+        print(traceback.format_exc())
+        return jsonify({"ok": False, "error": "读取表头失败，请查看本机运行日志"}), 500
     return jsonify({"ok": True, "headers": headers})
 
 

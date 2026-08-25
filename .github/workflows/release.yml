@@ -49,13 +49,33 @@ jobs:
           "asset=$asset" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "asset_path=$assetPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-      - name: Attest release archive
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --yes --no-progress
+
+      - name: Build Windows installer
+        id: installer
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart("v")
+          $compiler = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
+          & $compiler "/DMyAppVersion=$version" installer.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $setup = "data-summary-tool-setup-v$version.exe"
+          $setupPath = Join-Path $PWD "release\$setup"
+          if (-not (Test-Path -LiteralPath $setupPath)) { throw "Installer was not created: $setupPath" }
+          "setup=$setup" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "setup_path=$setupPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Attest release assets
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: ${{ steps.package.outputs.asset_path }}
+          subject-path: |
+            ${{ steps.package.outputs.asset_path }}
+            ${{ steps.installer.outputs.setup_path }}
 
       - name: Publish GitHub Release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create $env:GITHUB_REF_NAME "release/${{ steps.package.outputs.asset }}" --verify-tag --title $env:GITHUB_REF_NAME --generate-notes
+        run: gh release create $env:GITHUB_REF_NAME "release/${{ steps.package.outputs.asset }}" "release/${{ steps.installer.outputs.setup }}" --verify-tag --title $env:GITHUB_REF_NAME --generate-notes
