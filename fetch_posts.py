@@ -17,18 +17,26 @@ import re
 import sys
 import time
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timedelta, date, time
+from datetime import datetime, timedelta, date, time as dt_time
 from pathlib import Path
 from typing import Any, Callable
 
-RESOURCE_DIR = Path(__file__).resolve().parent
-# PyInstaller 单文件程序会把随包资源解压到临时目录；用户配置和同步状态
-# 必须保存在可执行文件旁边，不能写入该临时目录。
-SCRIPT_DIR = (
-    Path(sys.executable).resolve().parent
-    if getattr(sys, "frozen", False)
-    else RESOURCE_DIR
-)
+def resource_dir() -> Path:
+    """PyInstaller 打包后的只读资源目录（网页界面）。"""
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    return Path(__file__).resolve().parent
+
+
+def data_dir() -> Path:
+    """配置、状态、密钥所在目录（exe 旁边，可写）。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+SCRIPT_DIR = data_dir()
+RESOURCE_DIR = resource_dir()
 STATE_FILE = SCRIPT_DIR / "sync_state.json"
 SHEETS_EPOCH = datetime(1899, 12, 30)
 SCOPES = [
@@ -68,17 +76,28 @@ def is_transient_error(err: Exception) -> bool:
     return any(m in text for m in markers)
 
 
+def is_quota_error(err: Exception) -> bool:
+    text = str(err).lower()
+    return "429" in text or "quota" in text or "rate limit" in text
+
+
 def with_retry(fn, log: LogFn = print, what: str = "请求", tries: int = RETRY_TIMES):
     last: Exception | None = None
-    for i in range(tries):
+    n = max(tries, 8)
+    for i in range(n):
         try:
             return fn()
         except Exception as e:
             last = e
-            if not is_transient_error(e) or i >= tries - 1:
+            quota = is_quota_error(e)
+            if (not is_transient_error(e) and not quota) or i >= n - 1:
                 raise
-            wait = min(40, (2 ** i) + random.random() * 2)
-            log(f"  {what}连接中断，{wait:.0f} 秒后重试（{i + 1}/{tries}）… {e}")
+            if quota:
+                wait = min(120.0, 65.0 + i * 10.0) + random.random() * 8
+                log(f"  {what}额度用完，{wait:.0f} 秒后重试（{i + 1}/{n}）…")
+            else:
+                wait = min(40, (2 ** i) + random.random() * 2)
+                log(f"  {what}连接中断，{wait:.0f} 秒后重试（{i + 1}/{n}）… {e}")
             time.sleep(wait)
     raise last  # pragma: no cover
 
@@ -159,6 +178,11 @@ class Config:
     schedule_enabled: bool = False
     schedule_minutes: int = 60
     schedule_only_if_changed: bool = True
+    cf_publish_url: str = "https://promo.zhixianglife.com/api/publish-cache"
+    cf_publish_secret: str = ""
+    cf_publish_after_sync: bool = False
+    cf_publish_source: str = "all"  # all | hot
+    cf_chunk_size: int = 800
     align_schedule_enabled: bool = False
     align_schedule_minutes: int = 60
     align_schedule_only_if_changed: bool = True
@@ -171,6 +195,27 @@ class Config:
     align_source_sheet: str = ""
     align_header_row: int = 1
     align_headers: list[str] = field(default_factory=list)
+    # 视频时长：源表 B 列链接 → 日志表 + 数据表
+    vd_source_url: str = ""
+    vd_source_sheet: str = ""
+    vd_start_row: int = 2
+    vd_col_date: str = "A"
+    vd_col_link: str = "B"
+    vd_col_name: str = "H"
+    vd_col_type: str = "E"
+    vd_types: list[str] = field(default_factory=list)
+    vd_dest_url: str = ""
+    vd_log_sheet: str = "日志表"
+    vd_report_sheet: str = "数据表"
+    vd_out_start_row: int = 1
+    vd_include_headers: bool = True
+    vd_unit_seconds: int = 30
+    vd_count_mode: str = "divide_total"  # divide_total | per_video_ceil
+    vd_start_date: str = ""
+    vd_end_date: str = ""
+    vd_batch_size: int = 100
+    vd_schedule_enabled: bool = False
+    vd_schedule_minutes: int = 180
 
     def resolve_credentials(self) -> Path:
         candidates = []
@@ -187,7 +232,7 @@ class Config:
                 return p
         raise FileNotFoundError(
             "找不到服务账号 credentials.json。\n"
-            "请把 JSON 放到本目录，或在界面里填写路径。"
+            "请在软件顶部点击「选择服务账号」，从电脑中选择 JSON 文件。"
         )
 
 
@@ -204,7 +249,7 @@ def load_config(path: Path | None = None) -> Config:
                 path = candidate
                 break
     if path and path.exists():
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
         for k, v in raw.items():
             if not hasattr(cfg, k) or v is None:
                 continue
@@ -225,7 +270,7 @@ def save_config(cfg: Config, path: Path | None = None) -> Path:
 
 def service_account_email(cred_path: Path) -> str:
     try:
-        data = json.loads(cred_path.read_text(encoding="utf-8"))
+        data = json.loads(cred_path.read_text(encoding="utf-8-sig"))
         return str(data.get("client_email") or "")
     except Exception:
         return ""
@@ -375,7 +420,7 @@ def to_datetime(value: Any) -> datetime | None:
     if isinstance(value, datetime):
         return value.replace(tzinfo=None)
     if isinstance(value, date) and not isinstance(value, datetime):
-        return datetime.combine(value, time.min)
+        return datetime.combine(value, dt_time.min)
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
@@ -648,7 +693,7 @@ def authorize(cred_path: Path):
 def load_sync_state() -> dict[str, Any]:
     if STATE_FILE.exists():
         try:
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            return json.loads(STATE_FILE.read_text(encoding="utf-8-sig"))
         except Exception:
             pass
     return {"sources": {}, "last_run": ""}
@@ -656,6 +701,14 @@ def load_sync_state() -> dict[str, Any]:
 
 def save_sync_state(state: dict[str, Any]) -> None:
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def remember_cf_fingerprint(fingerprint: str, total_rows: int = 0) -> None:
+    state = load_sync_state()
+    state["cf_fingerprint"] = fingerprint
+    state["cf_total_rows"] = int(total_rows or 0)
+    state["cf_published_at"] = datetime.now().isoformat(timespec="seconds")
+    save_sync_state(state)
 
 
 def fetch_modified_time(gc, spreadsheet_id: str) -> str:
@@ -690,6 +743,11 @@ def sources_have_changed(gc, source_ids: list[str], log: LogFn = print) -> bool:
         return True
     for sid in source_ids:
         old, new = prev.get(sid) or "", now.get(sid) or ""
+        # Drive modifiedTime 偶尔会因权限或网络问题取不到。此时不能把空值
+        # 当成“没有变化”，否则定时任务会永久跳过实际需要同步的数据。
+        if not new:
+            log(f"无法确认源表更新时间，将安全执行: {sid}")
+            return True
         if old != new:
             log(f"源表有变化: {sid}")
             return True
@@ -1394,6 +1452,7 @@ def run(
     if target_ss is not None:
         opened[target_ss.id] = target_ss
 
+    cf_info = None
     if dry_run:
         log("dry-run：不写回 Google 表格")
     else:
@@ -1435,6 +1494,16 @@ def run(
             )
             hot_url = spreadsheet_url(hot_ss.id)
         remember_run_state(gc, [s.sid for s in source_refs])
+        if getattr(cfg, "cf_publish_after_sync", False):
+            from publish_cloudflare import publish_assets_to_cloudflare
+
+            src = str(getattr(cfg, "cf_publish_source", "all") or "all").strip().lower()
+            pub_rows = hot_rows if src == "hot" else merged
+            pub_groups = hot_groups if src == "hot" else group_values
+            log("汇总完成，开始直推 Cloudflare…")
+            cf_info = publish_assets_to_cloudflare(
+                cfg, headers, pub_rows, pub_groups, log=log
+            )
 
     result = {
         "ok": ok_sources > 0,
@@ -1449,6 +1518,7 @@ def run(
         "hot_sheet": cfg.hot_output_sheet or f"点赞{threshold}以上",
         "headers": headers,
         "skipped": False,
+        "cloudflare": cf_info,
     }
     log("完成")
     return result

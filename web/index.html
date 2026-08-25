@@ -4,13 +4,17 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>数据汇总工具</title>
+  <link rel="icon" href="/static/logo.png" />
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
   <header class="top">
-    <div>
-      <h1>数据汇总工具</h1>
-      <p>筛选汇总，或按表头对齐原样拷贝。两个功能分开，互不影响。</p>
+    <div class="brand">
+      <img class="logo" src="/static/logo.png" alt="" width="56" height="56" />
+      <div>
+        <h1>数据汇总工具</h1>
+        <p>筛选汇总，或按表头对齐原样拷贝。两个功能分开，互不影响。</p>
+      </div>
     </div>
     <div class="sa" id="saBox">
       <span class="sa-label">服务账号（源表和目标表都要共享给它 · 编辑者）</span>
@@ -102,10 +106,41 @@
     </section>
 
     <section class="card">
-      <h2>4. 定时同步 <em>需保持本程序开着</em></h2>
-      <p class="note">到点后重新抓取源表，按帖文id 增量更新目标表。勾选「仅源表变化时执行」则没改动就跳过。</p>
+      <h2>4. 发布到 Cloudflare <em>替代谷歌脚本推 CDN</em></h2>
+      <p class="note">
+        建议每天最多发布一次。图库页面读的是 CDN，不走 Functions。
+        不要点站点上的「刷新CDN」。数据和上次相同时会自动跳过，避免占免费配额。
+      </p>
+      <label>
+        发布地址
+        <input id="cf_publish_url" type="text" spellcheck="false"
+          value="https://promo.zhixianglife.com/api/publish-cache" />
+      </label>
+      <label>
+        CACHE_PUBLISH_SECRET
+        <input id="cf_publish_secret" type="password" spellcheck="false" placeholder="Cloudflare 后台的发布密钥" />
+      </label>
       <div class="row3">
-        <label>间隔（分钟） <input id="schedule_minutes" type="number" min="5" value="60" /></label>
+        <label>发布哪份数据
+          <select id="cf_publish_source">
+            <option value="all">全部结果</option>
+            <option value="hot">高赞结果</option>
+          </select>
+        </label>
+        <label class="check"><input id="cf_publish_after_sync" type="checkbox" /> 汇总后自动发布</label>
+        <span></span>
+      </div>
+      <div class="hint-row">
+        <span>密钥只保存在本机 config.json，不会写进仓库</span>
+        <button type="button" class="ghost" id="publishCfBtn">立即发布到 Cloudflare</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>5. 定时同步 <em>关掉窗口就不再跑</em></h2>
+      <p class="note">每天打开一次即可。默认间隔 1440 分钟（1 天）。打开后若已到期会先跑一轮。勾选「仅源表变化时执行」则没改动就跳过。不要勾选「汇总后自动发布」——整表推 Cloudflare 约 100 次 Functions，请用上面的按钮每天点一次。</p>
+      <div class="row3">
+        <label>间隔（分钟） <input id="schedule_minutes" type="number" min="5" value="1440" /></label>
         <label class="check"><input id="schedule_only_if_changed" type="checkbox" checked /> 仅源表有变化时执行</label>
         <label class="check"><input id="schedule_enabled" type="checkbox" /> 启用定时</label>
       </div>
@@ -116,7 +151,7 @@
     </section>
 
     <section class="card">
-      <button type="button" class="collapse-btn" id="fieldsBtn">5. 抓取字段（默认按截图，可改） ▾</button>
+      <button type="button" class="collapse-btn" id="fieldsBtn">6. 抓取字段（默认按截图，可改） ▾</button>
       <div id="fieldsPanel" class="more" hidden>
         <p class="note">对应「数据库」里的 D 列范围。以后换列，改这里即可，不必再给配置表。</p>
         <div class="field-table">

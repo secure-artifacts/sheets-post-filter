@@ -1,5 +1,5 @@
 {
-  "credentials_file": "C:\\Users\\Alienware\\inspiration-finder\\credentials.json",
+  "credentials_file": "",
   "config_url": "",
   "target_url": "",
   "sources": [],
@@ -19,5 +19,22 @@
   "sort_field": "点赞",
   "sort_descending": true,
   "start_date": "",
-  "end_date": ""
+  "end_date": "",
+  "vd_source_url": "",
+  "vd_source_sheet": "",
+  "vd_start_row": 2,
+  "vd_col_date": "A",
+  "vd_col_link": "B",
+  "vd_col_name": "H",
+  "vd_col_type": "E",
+  "vd_types": [],
+  "vd_dest_url": "",
+  "vd_log_sheet": "日志表",
+  "vd_report_sheet": "数据表",
+  "vd_out_start_row": 1,
+  "vd_include_headers": true,
+  "vd_unit_seconds": 30,
+  "vd_count_mode": "divide_total",
+  "vd_schedule_enabled": false,
+  "vd_schedule_minutes": 180
 }

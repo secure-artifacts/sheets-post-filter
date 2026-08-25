@@ -16,4 +16,6 @@ Thumbs.db
 .vscode/
 build/
 dist/
-*.spec
+release/
+*.zip
+*.spec.bak

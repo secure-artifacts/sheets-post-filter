@@ -1,49 +1,61 @@
-name: Build and Release
+name: Build and publish release
 
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
 
 jobs:
-  build-and-release:
+  windows-release:
     runs-on: windows-latest
-    permissions:
-      id-token: write
-      contents: write
-      attestations: write
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
           cache: pip
 
       - name: Install dependencies
-        run: python -m pip install --disable-pip-version-check -r requirements.txt pyinstaller
+        shell: pwsh
+        run: python -m pip install -r requirements.txt pyinstaller
 
-      - name: Build Windows executable
-        run: >-
-          pyinstaller
-          --noconfirm
-          --clean
-          --onefile
-          --windowed
-          --name data-summary-tool-windows
-          --add-data "web;web"
-          app.py
+      - name: Build Windows application
+        shell: pwsh
+        run: python -m PyInstaller --noconfirm --clean sheets_post_filter.spec
 
-      - name: Attest build provenance
+      - name: Prepare release archive
+        id: package
+        shell: pwsh
+        run: |
+          $source = Join-Path $PWD "dist\数据汇总工具"
+          $stage = Join-Path $PWD "release\data-summary-tool"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item -Path (Join-Path $source "*") -Destination $stage -Recurse -Force
+          Copy-Item config.example.json (Join-Path $stage "config.example.json") -Force
+          Copy-Item 使用说明.txt (Join-Path $stage "使用说明.txt") -Force
+          Copy-Item logo.ico (Join-Path $stage "logo.ico") -Force
+          Copy-Item uninstall-template.bat (Join-Path $stage "uninstall.bat") -Force
+          $asset = "data-summary-tool-windows-$env:GITHUB_REF_NAME.zip"
+          $assetPath = Join-Path $PWD "release\$asset"
+          Compress-Archive -Path $stage -DestinationPath $assetPath -CompressionLevel Optimal
+          "asset=$asset" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "asset_path=$assetPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Attest release archive
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: dist/data-summary-tool-windows.exe
+          subject-path: ${{ steps.package.outputs.asset_path }}
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/data-summary-tool-windows.exe
-          generate_release_notes: true
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create $env:GITHUB_REF_NAME "release/${{ steps.package.outputs.asset }}" --verify-tag --title $env:GITHUB_REF_NAME --generate-notes

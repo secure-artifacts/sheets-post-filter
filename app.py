@@ -3,15 +3,18 @@
 
 from __future__ import annotations
 
+import os
+import sys
 import threading
+import traceback
 import webbrowser
 from datetime import date, datetime, timedelta
 
 from flask import Flask, jsonify, render_template, request
 
 from fetch_posts import (
-    RESOURCE_DIR,
     SCRIPT_DIR,
+    RESOURCE_DIR,
     DEFAULT_FIELDS,
     Config,
     authorize,
@@ -20,11 +23,14 @@ from fetch_posts import (
     load_config,
     load_sync_state,
     normalize_sources,
+    open_by_url_or_id,
     parse_url_list,
     peek_source_headers,
+    read_sheet_values,
     run,
     run_align_sync,
     save_config,
+    save_sync_state,
     service_account_email,
     sources_have_changed,
     to_datetime,
@@ -61,6 +67,13 @@ _align_sched = {
     "enabled": False,
     "minutes": 60,
     "only_if_changed": True,
+    "next_run": None,
+    "last_msg": "",
+}
+_video_sched = {
+    "enabled": False,
+    "minutes": 180,
+    "only_if_changed": False,
     "next_run": None,
     "last_msg": "",
 }
@@ -102,10 +115,27 @@ def _cfg_from_payload(data: dict) -> Config:
         "align_target_url": "align_target_url",
         "align_output_sheet": "align_output_sheet",
         "align_source_sheet": "align_source_sheet",
+        "cf_publish_url": "cf_publish_url",
+        "cf_publish_secret": "cf_publish_secret",
+        "cf_publish_source": "cf_publish_source",
+        "vd_source_url": "vd_source_url",
+        "vd_source_sheet": "vd_source_sheet",
+        "vd_col_date": "vd_col_date",
+        "vd_col_link": "vd_col_link",
+        "vd_col_name": "vd_col_name",
+        "vd_col_type": "vd_col_type",
+        "vd_dest_url": "vd_dest_url",
+        "vd_log_sheet": "vd_log_sheet",
+        "vd_report_sheet": "vd_report_sheet",
+        "vd_count_mode": "vd_count_mode",
+        "vd_start_date": "vd_start_date",
+        "vd_end_date": "vd_end_date",
     }
     for src, dest in mapping.items():
         if src in data and data[src] is not None:
             setattr(cfg, dest, str(data[src]).strip())
+    if cfg.vd_count_mode not in ("divide_total", "per_video_ceil"):
+        cfg.vd_count_mode = "divide_total"
     raw_sources = data.get("sources")
     if raw_sources is None:
         raw_sources = data.get("source_urls")
@@ -116,6 +146,13 @@ def _cfg_from_payload(data: dict) -> Config:
     if "align_sources" in data:
         refs = normalize_sources(data.get("align_sources"))
         cfg.align_sources = [{"name": s.name, "url": s.url, "sheet": s.sheet} for s in refs]
+    if "vd_types" in data:
+        raw_t = data.get("vd_types")
+        if isinstance(raw_t, str):
+            parts = raw_t.replace("，", "\n").replace(",", "\n").replace(";", "\n").splitlines()
+            cfg.vd_types = [ln.strip() for ln in parts if ln.strip()]
+        elif isinstance(raw_t, list):
+            cfg.vd_types = [str(x).strip() for x in raw_t if str(x).strip()]
     if "align_headers" in data:
         raw_h = data.get("align_headers")
         if isinstance(raw_h, str):
@@ -142,10 +179,13 @@ def _cfg_from_payload(data: dict) -> Config:
         "schedule_only_if_changed",
         "align_schedule_enabled",
         "align_schedule_only_if_changed",
+        "vd_schedule_enabled",
+        "cf_publish_after_sync",
+        "vd_include_headers",
     ):
         if flag in data:
             setattr(cfg, flag, bool(data[flag]))
-    for key in ("output_start_row", "hot_start_row", "align_start_row", "align_header_row"):
+    for key in ("output_start_row", "hot_start_row", "align_start_row", "align_header_row", "vd_start_row", "vd_out_start_row"):
         if key in data and str(data[key]).strip():
             try:
                 setattr(cfg, key, max(1, int(data[key])))
@@ -164,6 +204,21 @@ def _cfg_from_payload(data: dict) -> Config:
     if "align_schedule_minutes" in data and str(data["align_schedule_minutes"]).strip() != "":
         try:
             cfg.align_schedule_minutes = max(5, int(data["align_schedule_minutes"]))
+        except ValueError:
+            pass
+    if "vd_schedule_minutes" in data and str(data["vd_schedule_minutes"]).strip() != "":
+        try:
+            cfg.vd_schedule_minutes = max(5, int(data["vd_schedule_minutes"]))
+        except ValueError:
+            pass
+    if "vd_unit_seconds" in data and str(data["vd_unit_seconds"]).strip() != "":
+        try:
+            cfg.vd_unit_seconds = max(1, int(data["vd_unit_seconds"]))
+        except ValueError:
+            pass
+    if "vd_batch_size" in data and str(data["vd_batch_size"]).strip() != "":
+        try:
+            cfg.vd_batch_size = max(20, min(500, int(data["vd_batch_size"])))
         except ValueError:
             pass
     return cfg
@@ -199,7 +254,22 @@ def _run_job(cfg: Config, from_schedule: bool = False) -> None:
         _job_lock.release()
 
 
-def _snap(st: dict) -> dict:
+def _schedule_state_key(kind: str) -> str:
+    return f"{kind}_schedule_last_run"
+
+
+def _schedule_last_run(kind: str) -> str:
+    state = load_sync_state() or {}
+    return str(state.get(_schedule_state_key(kind)) or (state.get("last_run") if kind == "filter" else "") or "")
+
+
+def _remember_schedule_run(kind: str) -> None:
+    state = load_sync_state() or {}
+    state[_schedule_state_key(kind)] = datetime.now().isoformat(timespec="seconds")
+    save_sync_state(state)
+
+
+def _snap(st: dict, kind: str) -> dict:
     nxt = st["next_run"]
     return {
         "enabled": st["enabled"],
@@ -207,16 +277,20 @@ def _snap(st: dict) -> dict:
         "only_if_changed": st["only_if_changed"],
         "next_run": nxt.strftime("%Y-%m-%d %H:%M:%S") if isinstance(nxt, datetime) else "",
         "last_msg": st["last_msg"],
-        "last_sync": (load_sync_state() or {}).get("last_run") or "",
+        "last_sync": _schedule_last_run(kind),
     }
 
 
 def _schedule_snapshot() -> dict:
-    return _snap(_sched)
+    return _snap(_sched, "filter")
 
 
 def _align_schedule_snapshot() -> dict:
-    return _snap(_align_sched)
+    return _snap(_align_sched, "align")
+
+
+def _video_schedule_snapshot() -> dict:
+    return _snap(_video_sched, "video")
 
 
 def _ensure_sched_thread() -> None:
@@ -237,38 +311,89 @@ def _try_fire(st: dict, kind: str) -> None:
     if datetime.now() < nxt:
         return
     if not _job_lock.acquire(blocking=False):
-        st["last_msg"] = "到点时上一轮还在跑，稍后重试"
         with _sched_lock:
+            st["last_msg"] = "到点时上一轮还在跑，1 分钟后重试"
             st["next_run"] = datetime.now() + timedelta(minutes=1)
         return
-    cfg = load_config()
-    _reset_job()
-    _log(f"{'表头对齐' if kind == 'align' else '筛选汇总'}定时任务开始（间隔 {minutes} 分钟）")
-    if kind == "align":
-        _run_align_job(cfg, from_schedule=True)
-    else:
-        _run_job(cfg, from_schedule=True)
-    with _sched_lock:
-        if st["enabled"]:
-            st["next_run"] = datetime.now() + timedelta(minutes=max(5, st["minutes"]))
-            st["last_msg"] = "已执行"
+    labels = {"filter": "筛选汇总", "align": "表头对齐", "video": "视频时长"}
+    try:
+        cfg = load_config()
+        _reset_job()
+        _log(f"{labels.get(kind, kind)}定时任务开始（间隔 {minutes} 分钟）")
+        if kind == "align":
+            _run_align_job(cfg, from_schedule=True)
+        elif kind == "video":
+            _run_video_job(cfg, from_schedule=True)
         else:
-            st["next_run"] = None
+            _run_job(cfg, from_schedule=True)
+    except Exception as exc:
+        _job["error"] = str(exc)
+        _job["running"] = False
+        _job["finished_at"] = datetime.now().strftime("%H:%M:%S")
+        _log(f"{labels.get(kind, kind)}定时调度失败: {exc}")
+        if _job_lock.locked():
+            _job_lock.release()
+    finally:
+        try:
+            _remember_schedule_run(kind)
+        except Exception as exc:
+            _log(f"保存定时状态失败: {exc}")
+        with _sched_lock:
+            if st["enabled"]:
+                st["next_run"] = datetime.now() + timedelta(minutes=max(5, st["minutes"]))
+                st["last_msg"] = "已执行" if not _job.get("error") else "执行失败，下一轮会重试"
+            else:
+                st["next_run"] = None
 
 
 def _scheduler_loop() -> None:
     while not _sched_stop.wait(5):
-        _try_fire(_sched, "filter")
-        _try_fire(_align_sched, "align")
+        for st, kind in (
+            (_sched, "filter"),
+            (_align_sched, "align"),
+            (_video_sched, "video"),
+        ):
+            try:
+                _try_fire(st, kind)
+            except Exception as exc:
+                _log(f"定时器异常（{kind}）: {exc}")
+                with _sched_lock:
+                    if st["enabled"]:
+                        st["next_run"] = datetime.now() + timedelta(minutes=1)
+                        st["last_msg"] = "定时器异常，1 分钟后重试"
+
+
+def _last_run_is_stale(minutes: int, kind: str = "filter") -> bool:
+    raw = _schedule_last_run(kind)
+    if not raw:
+        return True
+    try:
+        last = datetime.fromisoformat(str(raw).replace("Z", ""))
+    except ValueError:
+        return True
+    return datetime.now() - last >= timedelta(minutes=max(5, int(minutes)))
 
 
 def start_scheduler(minutes: int, only_if_changed: bool) -> None:
+    minutes = max(5, int(minutes))
     with _sched_lock:
+        preserve_next = (
+            _sched["enabled"]
+            and _sched["minutes"] == minutes
+            and isinstance(_sched["next_run"], datetime)
+        )
         _sched["enabled"] = True
-        _sched["minutes"] = max(5, int(minutes))
+        _sched["minutes"] = minutes
         _sched["only_if_changed"] = bool(only_if_changed)
-        _sched["next_run"] = datetime.now() + timedelta(minutes=_sched["minutes"])
-        _sched["last_msg"] = "已启动"
+        # 每天打开软件：若距上次已超过间隔，十几秒后先跑一轮，不必空等 60 分钟
+        if preserve_next:
+            pass
+        elif _last_run_is_stale(minutes, "filter"):
+            _sched["next_run"] = datetime.now() + timedelta(seconds=12)
+            _sched["last_msg"] = "已启动，即将执行一次"
+        else:
+            _sched["next_run"] = datetime.now() + timedelta(minutes=minutes)
+            _sched["last_msg"] = "已启动"
     _ensure_sched_thread()
 
 
@@ -280,12 +405,20 @@ def stop_scheduler() -> None:
 
 
 def start_align_scheduler(minutes: int, only_if_changed: bool) -> None:
+    minutes = max(5, int(minutes))
     with _sched_lock:
+        preserve_next = (
+            _align_sched["enabled"]
+            and _align_sched["minutes"] == minutes
+            and isinstance(_align_sched["next_run"], datetime)
+        )
         _align_sched["enabled"] = True
-        _align_sched["minutes"] = max(5, int(minutes))
+        _align_sched["minutes"] = minutes
         _align_sched["only_if_changed"] = bool(only_if_changed)
-        _align_sched["next_run"] = datetime.now() + timedelta(minutes=_align_sched["minutes"])
-        _align_sched["last_msg"] = "已启动"
+        if not preserve_next:
+            delay = timedelta(seconds=12) if _last_run_is_stale(minutes, "align") else timedelta(minutes=minutes)
+            _align_sched["next_run"] = datetime.now() + delay
+            _align_sched["last_msg"] = "已启动，即将执行一次" if delay.seconds == 12 else "已启动"
     _ensure_sched_thread()
 
 
@@ -294,6 +427,30 @@ def stop_align_scheduler() -> None:
         _align_sched["enabled"] = False
         _align_sched["next_run"] = None
         _align_sched["last_msg"] = "已停止"
+
+
+def start_video_scheduler(minutes: int) -> None:
+    minutes = max(5, int(minutes))
+    with _sched_lock:
+        preserve_next = (
+            _video_sched["enabled"]
+            and _video_sched["minutes"] == minutes
+            and isinstance(_video_sched["next_run"], datetime)
+        )
+        _video_sched["enabled"] = True
+        _video_sched["minutes"] = minutes
+        if not preserve_next:
+            delay = timedelta(seconds=12) if _last_run_is_stale(minutes, "video") else timedelta(minutes=minutes)
+            _video_sched["next_run"] = datetime.now() + delay
+            _video_sched["last_msg"] = "已启动，即将执行一次" if delay.seconds == 12 else "已启动"
+    _ensure_sched_thread()
+
+
+def stop_video_scheduler() -> None:
+    with _sched_lock:
+        _video_sched["enabled"] = False
+        _video_sched["next_run"] = None
+        _video_sched["last_msg"] = "已停止"
 
 
 @app.get("/")
@@ -357,14 +514,152 @@ def api_config():
                 "align_schedule_enabled": cfg.align_schedule_enabled,
                 "align_schedule_minutes": cfg.align_schedule_minutes,
                 "align_schedule_only_if_changed": cfg.align_schedule_only_if_changed,
+                "vd_schedule_enabled": cfg.vd_schedule_enabled,
+                "vd_schedule_minutes": cfg.vd_schedule_minutes,
+                "cf_publish_url": cfg.cf_publish_url,
+                "cf_publish_secret": cfg.cf_publish_secret,
+                "cf_publish_after_sync": cfg.cf_publish_after_sync,
+                "cf_publish_source": cfg.cf_publish_source,
             },
             "service_account_email": email,
             "credentials_ok": cred_ok,
             "default_fields": DEFAULT_FIELDS,
             "schedule": _schedule_snapshot(),
             "align_schedule": _align_schedule_snapshot(),
+            "video_schedule": _video_schedule_snapshot(),
         }
     )
+
+
+def start_filter_job(cfg: Config, from_schedule: bool = False) -> str | None:
+    if not _job_lock.acquire(blocking=False):
+        return "正在运行中，请等当前任务结束"
+    save_config(cfg)
+    _reset_job()
+    threading.Thread(target=_run_job, args=(cfg, from_schedule), daemon=True).start()
+    return None
+
+
+def start_publish_job(cfg: Config) -> str | None:
+    if not _job_lock.acquire(blocking=False):
+        return "正在运行中，请等当前任务结束"
+    save_config(cfg)
+    _reset_job()
+
+    def _run_publish():
+        try:
+            from publish_cloudflare import (
+                overlay_formula_urls,
+                publish_assets_to_cloudflare,
+                split_sheet_for_publish,
+            )
+
+            gc = authorize(cfg.resolve_credentials())
+            src = str(cfg.cf_publish_source or "all").strip().lower()
+            if src == "hot":
+                url = cfg.hot_target_url or cfg.target_url
+                sheet = cfg.hot_output_sheet or "点赞1000以上"
+                start = int(cfg.hot_start_row or 1)
+                include_headers = bool(cfg.hot_include_headers)
+            else:
+                url = cfg.target_url
+                sheet = cfg.output_sheet
+                start = int(cfg.output_start_row or 1)
+                include_headers = bool(cfg.include_headers)
+            if not url:
+                raise RuntimeError("请先填写要发布的目标表链接")
+            ss = open_by_url_or_id(gc, url, log=_log)
+            ws = ss.worksheet(sheet)
+            values = read_sheet_values(ws, log=_log)
+            headers, rows, how, data_start = split_sheet_for_publish(
+                values, start, include_headers
+            )
+            _log(
+                f"从「{ss.title}」/{sheet} 读取 {len(rows)} 行（{how}），开始发布 Cloudflare"
+            )
+            overlay_formula_urls(ws, rows, data_start, log=_log)
+            result = publish_assets_to_cloudflare(
+                cfg, headers, rows, None, log=_log, start_row=data_start
+            )
+            _job["result"] = {"ok": True, "mode": "cloudflare", **result}
+        except Exception as e:
+            _job["error"] = str(e)
+            _log(f"失败: {e}")
+            print(traceback.format_exc())
+        finally:
+            _job["running"] = False
+            _job["finished_at"] = datetime.now().strftime("%H:%M:%S")
+            if _job_lock.locked():
+                _job_lock.release()
+
+    threading.Thread(target=_run_publish, daemon=True).start()
+    return None
+
+
+def start_align_job(cfg: Config, from_schedule: bool = False) -> str | None:
+    if not cfg.align_sources:
+        return "请至少填写一个数据源表格链接"
+    if not cfg.align_target_url:
+        return "请填写目标表链接"
+    if not cfg.align_headers:
+        return "请配置规范表头（一行一个）"
+    if not _job_lock.acquire(blocking=False):
+        return "正在运行中，请等当前任务结束"
+    save_config(cfg)
+    _reset_job()
+    threading.Thread(target=_run_align_job, args=(cfg, from_schedule), daemon=True).start()
+    return None
+
+
+def _run_video_job(cfg: Config, from_schedule: bool = False) -> None:
+    try:
+        from video_duration import run_video_duration
+
+        result = run_video_duration(cfg, log=_log)
+        _job["result"] = result
+    except Exception as e:
+        _job["error"] = str(e)
+        _log(f"失败: {e}")
+        print(traceback.format_exc())
+    finally:
+        _job["running"] = False
+        _job["finished_at"] = datetime.now().strftime("%H:%M:%S")
+        if _job_lock.locked():
+            _job_lock.release()
+
+
+def start_video_job(cfg: Config) -> str | None:
+    if not (getattr(cfg, "vd_source_url", "") or "").strip():
+        return "请填写视频时长源表链接"
+    if not (getattr(cfg, "vd_dest_url", "") or "").strip():
+        return "请填写写入目标表格链接"
+    if not _job_lock.acquire(blocking=False):
+        return "正在运行中，请等当前任务结束"
+    save_config(cfg)
+    _reset_job()
+    threading.Thread(target=_run_video_job, args=(cfg, False), daemon=True).start()
+    return None
+
+
+@app.post("/api/run-video")
+def api_run_video():
+    data = request.get_json(force=True) or {}
+    cfg = _cfg_from_payload(data)
+    err = start_video_job(cfg)
+    if err:
+        code = 409 if "运行中" in err else 400
+        return jsonify({"ok": False, "error": err}), code
+    return jsonify({"ok": True})
+
+
+@app.post("/api/publish-cf")
+def api_publish_cf():
+    data = request.get_json(force=True) or {}
+    cfg = _cfg_from_payload(data)
+    err = start_publish_job(cfg)
+    if err:
+        return jsonify({"ok": False, "error": err}), 409
+    return jsonify({"ok": True})
 
 
 @app.post("/api/save")
@@ -512,6 +807,7 @@ def api_status():
             "finished_at": _job["finished_at"],
             "schedule": _schedule_snapshot(),
             "align_schedule": _align_schedule_snapshot(),
+            "video_schedule": _video_schedule_snapshot(),
         }
     )
 
@@ -519,24 +815,53 @@ def api_status():
 def main() -> None:
     import socket
 
+    os.chdir(SCRIPT_DIR)
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     port = 8765
-    for p in range(8765, 8785):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            if s.connect_ex(("127.0.0.1", p)) != 0:
-                port = p
-                break
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        already = probe.connect_ex(("127.0.0.1", port)) == 0
+    if already:
+        url = f"http://127.0.0.1:{port}"
+        print(f"已经在运行，打开 {url}")
+        webbrowser.open(url)
+        return
+
     url = f"http://127.0.0.1:{port}"
     print(f"界面地址: {url}")
+    print("请保持这个窗口开着。关掉后定时同步会停止。")
     cfg = load_config()
     if cfg.schedule_enabled:
         start_scheduler(cfg.schedule_minutes, cfg.schedule_only_if_changed)
         print(f"已按配置恢复筛选定时：每 {cfg.schedule_minutes} 分钟")
+        if _last_run_is_stale(cfg.schedule_minutes):
+            print("距上次同步已超过间隔，约 12 秒后自动跑一轮")
     if cfg.align_schedule_enabled:
         start_align_scheduler(cfg.align_schedule_minutes, cfg.align_schedule_only_if_changed)
         print(f"已按配置恢复对齐定时：每 {cfg.align_schedule_minutes} 分钟")
+    if cfg.vd_schedule_enabled and cfg.vd_source_url and cfg.vd_dest_url:
+        start_video_scheduler(cfg.vd_schedule_minutes)
+        print(f"已按配置恢复视频时长定时：每 {cfg.vd_schedule_minutes} 分钟")
     threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False)
 
 
+def _pause_on_error() -> None:
+    try:
+        input("出错了，按回车关闭窗口。")
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        traceback.print_exc()
+        _pause_on_error()
+        raise

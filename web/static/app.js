@@ -21,6 +21,9 @@ const fields = [
   "align_source_sheet",
   "align_header_row",
   "align_schedule_minutes",
+  "cf_publish_url",
+  "cf_publish_secret",
+  "cf_publish_source",
 ];
 
 const checks = [
@@ -36,6 +39,7 @@ const checks = [
   "align_include_headers",
   "align_schedule_enabled",
   "align_schedule_only_if_changed",
+  "cf_publish_after_sync",
 ];
 
 let defaultFields = [];
@@ -291,7 +295,12 @@ async function poll() {
     setState(r.ok ? "ok" : "bad", r.ok ? "完成" : "部分失败");
     const failed = (r.sources || []).filter((s) => s.error).length;
     $("summary").hidden = false;
-    if (r.mode === "align") {
+    if (r.mode === "cloudflare") {
+      $("summary").textContent = r.skipped
+        ? `数据和上次相同，已跳过发布（${r.totalRows || 0} 条），不占 Cloudflare 配额`
+        : `已发布 Cloudflare ${r.totalRows || 0} 条` +
+          (r.publicManifestUrl ? ` · ${r.publicManifestUrl}` : "");
+    } else if (r.mode === "align") {
       $("summary").textContent =
         `对齐写入 ${r.total_rows} 行` + (failed ? ` · ${failed} 个源失败` : "");
       if (r.target_url) {
@@ -475,6 +484,29 @@ $("resetFields").addEventListener("click", () => setFieldMaps(defaultFields));
 $("saveBtn").addEventListener("click", () => saveConfig(false));
 $("saveAlignBtn").addEventListener("click", () => saveConfig(false));
 $("runBtn").addEventListener("click", startRun);
+$("publishCfBtn").addEventListener("click", async () => {
+  $("summary").hidden = true;
+  $("log").textContent = "";
+  if (!$("cf_publish_url").value.trim() || !$("cf_publish_secret").value.trim()) {
+    setState("bad", "缺密钥");
+    $("summary").hidden = false;
+    $("summary").textContent = "请填写 Cloudflare 发布地址和 CACHE_PUBLISH_SECRET";
+    return;
+  }
+  const res = await fetch("/api/publish-cf", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload()),
+  });
+  const data = await res.json();
+  if (!data.ok) {
+    setState("bad", "无法开始");
+    $("summary").hidden = false;
+    $("summary").textContent = data.error || "发布失败";
+    return;
+  }
+  beginJob();
+});
 $("runAlignBtn").addEventListener("click", startAlign);
 $("peekHeaders").addEventListener("click", peekHeaders);
 $("align_headers").addEventListener("input", updateAlignHeaderCount);
@@ -533,8 +565,8 @@ $("fieldsBtn").addEventListener("click", () => {
   const panel = $("fieldsPanel");
   panel.hidden = !panel.hidden;
   $("fieldsBtn").textContent = panel.hidden
-    ? "5. 抓取字段（默认按截图，可改） ▾"
-    : "5. 抓取字段（默认按截图，可改） ▴";
+    ? "6. 抓取字段（默认按截图，可改） ▾"
+    : "6. 抓取字段（默认按截图，可改） ▴";
 });
 
 loadConfig();
