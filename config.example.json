@@ -22,6 +22,7 @@
   "end_date": "",
   "vd_source_url": "",
   "vd_source_sheet": "",
+  "vd_source_sheets": [],
   "vd_start_row": 2,
   "vd_col_date": "A",
   "vd_col_link": "B",
@@ -36,5 +37,27 @@
   "vd_unit_seconds": 30,
   "vd_count_mode": "divide_total",
   "vd_schedule_enabled": false,
-  "vd_schedule_minutes": 180
+  "vd_schedule_minutes": 180,
+  "vd_date_filter_enabled": true,
+  "vd_type_filter_mode": "include",
+  "vd_write_log": false,
+  "vd_columns": [
+    {"field": "日期", "role": "date", "column": "A"},
+    {"field": "视频链接", "role": "link", "column": "B"},
+    {"field": "名字", "role": "name", "column": "H"},
+    {"field": "类型", "role": "type", "column": "E"}
+  ],
+  "catalog_index_url": "",
+  "catalog_index_sheet": "",
+  "catalog_start_row": 2,
+  "catalog_url_col": "B",
+  "catalog_sheet_col": "D",
+  "catalog_target_url": "",
+  "catalog_output_sheet": "目录汇总",
+  "catalog_output_start_row": 1,
+  "catalog_keep_each_header": false,
+  "align_mappings": [],
+  "align_mapping_profiles": {},
+  "ui_menus": [],
+  "ui_active_menu": "filter-default"
 }

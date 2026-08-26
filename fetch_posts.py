@@ -216,6 +216,35 @@ class Config:
     vd_batch_size: int = 100
     vd_schedule_enabled: bool = False
     vd_schedule_minutes: int = 180
+    # 左侧工作区菜单。每个菜单实例保存独立模板配置，旧配置仍保留兼容。
+    ui_menus: list[dict] = field(default_factory=list)
+    ui_active_menu: str = "filter-default"
+    # 目录表驱动汇总：索引表中一列是链接，另一列是工作表名称。
+    catalog_index_url: str = ""
+    catalog_index_sheet: str = ""
+    catalog_start_row: int = 2
+    catalog_url_col: str = "B"
+    catalog_sheet_col: str = "D"
+    catalog_target_url: str = ""
+    catalog_output_sheet: str = "目录汇总"
+    catalog_output_start_row: int = 1
+    catalog_keep_each_header: bool = False
+    # 表头对齐支持“目标字段 <- 源字段”及按源链接覆盖。
+    align_mappings: list[dict] = field(default_factory=list)
+    align_mapping_profiles: dict[str, list[dict]] = field(default_factory=dict)
+    # 自定义视频分类汇总。
+    vd_source_sheets: list[str] = field(default_factory=list)
+    vd_date_filter_enabled: bool = True
+    vd_type_filter_mode: str = "include"  # include | exclude | all
+    vd_write_log: bool = False
+    vd_columns: list[dict] = field(
+        default_factory=lambda: [
+            {"field": "日期", "role": "date", "column": "A"},
+            {"field": "视频链接", "role": "link", "column": "B"},
+            {"field": "名字", "role": "name", "column": "H"},
+            {"field": "类型", "role": "type", "column": "E"},
+        ]
+    )
 
     def resolve_credentials(self) -> Path:
         candidates = []
@@ -1582,12 +1611,26 @@ def peek_source_headers(
 
 
 def run_align_sync(cfg: Config, log: LogFn = print) -> dict[str, Any]:
-    """按自定义表头对齐拷贝：源表有对应列就写入，没有就留空。"""
+    """按字段映射对齐拷贝；每个源链接可覆盖默认映射。"""
     cred_path = cfg.resolve_credentials()
     log(f"服务账号: {service_account_email(cred_path) or cred_path}")
-    headers = [_norm_header(h) for h in (cfg.align_headers or []) if _norm_header(h)]
+    default_mappings: list[dict[str, str]] = []
+    for item in getattr(cfg, "align_mappings", []) or []:
+        if not isinstance(item, dict):
+            continue
+        target = _norm_header(item.get("target") or item.get("name") or "")
+        source = _norm_header(item.get("source") or target)
+        if target:
+            default_mappings.append({"target": target, "source": source or target})
+    if not default_mappings:
+        default_mappings = [
+            {"target": _norm_header(h), "source": _norm_header(h)}
+            for h in (cfg.align_headers or [])
+            if _norm_header(h)
+        ]
+    headers = [item["target"] for item in default_mappings]
     if not headers:
-        raise RuntimeError("请先配置要对齐的表头（一行一个）")
+        raise RuntimeError("请先配置字段映射")
     source_refs = normalize_sources(cfg.align_sources)
     if not source_refs:
         raise RuntimeError("请至少填写一个数据源表格链接")
@@ -1597,7 +1640,7 @@ def run_align_sync(cfg: Config, log: LogFn = print) -> dict[str, Any]:
 
     gc = authorize(cred_path)
     header_row_n = max(1, int(cfg.align_header_row or 1))
-    log(f"规范表头 {len(headers)} 列: " + "、".join(headers))
+    log(f"字段映射 {len(headers)} 列: " + "、".join(headers))
     log(f"源表 {len(source_refs)} 个 · 表头在第 {header_row_n} 行")
 
     merged: list[list[Any]] = []
@@ -1625,13 +1668,27 @@ def run_align_sync(cfg: Config, log: LogFn = print) -> dict[str, Any]:
             if len(values) < header_row_n:
                 raise RuntimeError(f"工作表不足 {header_row_n} 行，读不到表头")
             hmap = header_index_map(values[header_row_n - 1])
-            missing = [h for h in headers if lookup_header(hmap, h) is None]
+            profiles = getattr(cfg, "align_mapping_profiles", {}) or {}
+            raw_profile = profiles.get(src.url) or profiles.get(src.sid) or []
+            profile_by_target = {
+                _norm_header(x.get("target") or x.get("name") or ""): _norm_header(
+                    x.get("source") or x.get("target") or x.get("name") or ""
+                )
+                for x in raw_profile
+                if isinstance(x, dict) and _norm_header(x.get("target") or x.get("name") or "")
+            }
+            source_headers = [profile_by_target.get(item["target"], item["source"]) for item in default_mappings]
+            missing = [
+                headers[index]
+                for index, source_header in enumerate(source_headers)
+                if lookup_header(hmap, source_header) is None
+            ]
             item["missing"] = missing
             if missing:
                 log(f"  缺少表头（这些列留空）: " + "、".join(missing))
             else:
                 log("  表头齐全")
-            col_idx = [lookup_header(hmap, h) for h in headers]
+            col_idx = [lookup_header(hmap, source_header) for source_header in source_headers]
             kept = 0
             for raw in values[header_row_n:]:
                 if not any(str(c).strip() for c in raw):

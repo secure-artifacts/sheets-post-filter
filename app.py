@@ -12,6 +12,8 @@ from datetime import date, datetime, timedelta
 
 from flask import Flask, jsonify, render_template, request
 
+from catalog_merge import run_catalog_merge
+
 from fetch_posts import (
     SCRIPT_DIR,
     RESOURCE_DIR,
@@ -95,6 +97,14 @@ def _log(msg: str) -> None:
     print(f"[{line['t']}] {msg}")
 
 
+def _record_job_failure(exc: Exception, context: str = "任务") -> None:
+    """Keep exception details local instead of returning them through the web API."""
+    message = f"{context}失败，请查看本机运行日志"
+    _job["error"] = message
+    _log(message)
+    print(traceback.format_exc())
+
+
 def _cfg_from_payload(data: dict) -> Config:
     cfg = load_config()
     mapping = {
@@ -130,6 +140,14 @@ def _cfg_from_payload(data: dict) -> Config:
         "vd_count_mode": "vd_count_mode",
         "vd_start_date": "vd_start_date",
         "vd_end_date": "vd_end_date",
+        "catalog_index_url": "catalog_index_url",
+        "catalog_index_sheet": "catalog_index_sheet",
+        "catalog_url_col": "catalog_url_col",
+        "catalog_sheet_col": "catalog_sheet_col",
+        "catalog_target_url": "catalog_target_url",
+        "catalog_output_sheet": "catalog_output_sheet",
+        "ui_active_menu": "ui_active_menu",
+        "vd_type_filter_mode": "vd_type_filter_mode",
     }
     for src, dest in mapping.items():
         if src in data and data[src] is not None:
@@ -159,6 +177,36 @@ def _cfg_from_payload(data: dict) -> Config:
             cfg.align_headers = [ln.strip() for ln in raw_h.splitlines() if ln.strip()]
         elif isinstance(raw_h, list):
             cfg.align_headers = [str(x).strip() for x in raw_h if str(x).strip()]
+    if "align_mappings" in data and isinstance(data["align_mappings"], list):
+        cfg.align_mappings = [
+            {
+                "target": str(item.get("target") or "").strip(),
+                "source": str(item.get("source") or item.get("target") or "").strip(),
+            }
+            for item in data["align_mappings"]
+            if isinstance(item, dict) and str(item.get("target") or "").strip()
+        ]
+        cfg.align_headers = [item["target"] for item in cfg.align_mappings]
+    if "align_mapping_profiles" in data and isinstance(data["align_mapping_profiles"], dict):
+        cfg.align_mapping_profiles = data["align_mapping_profiles"]
+    if "ui_menus" in data and isinstance(data["ui_menus"], list):
+        cfg.ui_menus = [item for item in data["ui_menus"] if isinstance(item, dict)]
+    if "vd_source_sheets" in data:
+        raw_sheets = data.get("vd_source_sheets")
+        if isinstance(raw_sheets, str):
+            cfg.vd_source_sheets = [x.strip() for x in raw_sheets.replace("，", "\n").replace(",", "\n").splitlines() if x.strip()]
+        elif isinstance(raw_sheets, list):
+            cfg.vd_source_sheets = [str(x).strip() for x in raw_sheets if str(x).strip()]
+    if "vd_columns" in data and isinstance(data["vd_columns"], list):
+        cfg.vd_columns = [
+            {
+                "field": str(item.get("field") or item.get("role") or "分类").strip(),
+                "role": str(item.get("role") or "type").strip().lower(),
+                "column": str(item.get("column") or "").strip().upper(),
+            }
+            for item in data["vd_columns"]
+            if isinstance(item, dict) and str(item.get("column") or "").strip()
+        ]
     if "fields" in data and isinstance(data["fields"], list):
         cleaned = []
         for item in data["fields"]:
@@ -182,10 +230,13 @@ def _cfg_from_payload(data: dict) -> Config:
         "vd_schedule_enabled",
         "cf_publish_after_sync",
         "vd_include_headers",
+        "catalog_keep_each_header",
+        "vd_date_filter_enabled",
+        "vd_write_log",
     ):
         if flag in data:
             setattr(cfg, flag, bool(data[flag]))
-    for key in ("output_start_row", "hot_start_row", "align_start_row", "align_header_row", "vd_start_row", "vd_out_start_row"):
+    for key in ("output_start_row", "hot_start_row", "align_start_row", "align_header_row", "vd_start_row", "vd_out_start_row", "catalog_start_row", "catalog_output_start_row"):
         if key in data and str(data[key]).strip():
             try:
                 setattr(cfg, key, max(1, int(data[key])))
@@ -246,8 +297,7 @@ def _run_job(cfg: Config, from_schedule: bool = False) -> None:
         )
         _job["result"] = result
     except Exception as e:
-        _job["error"] = str(e)
-        _log(f"失败: {e}")
+        _record_job_failure(e, "筛选汇总")
     finally:
         _job["running"] = False
         _job["finished_at"] = datetime.now().strftime("%H:%M:%S")
@@ -327,17 +377,17 @@ def _try_fire(st: dict, kind: str) -> None:
         else:
             _run_job(cfg, from_schedule=True)
     except Exception as exc:
-        _job["error"] = str(exc)
+        _record_job_failure(exc, f"{labels.get(kind, kind)}定时调度")
         _job["running"] = False
         _job["finished_at"] = datetime.now().strftime("%H:%M:%S")
-        _log(f"{labels.get(kind, kind)}定时调度失败: {exc}")
         if _job_lock.locked():
             _job_lock.release()
     finally:
         try:
             _remember_schedule_run(kind)
         except Exception as exc:
-            _log(f"保存定时状态失败: {exc}")
+            _log("保存定时状态失败，请查看本机运行日志")
+            print(traceback.format_exc())
         with _sched_lock:
             if st["enabled"]:
                 st["next_run"] = datetime.now() + timedelta(minutes=max(5, st["minutes"]))
@@ -356,7 +406,8 @@ def _scheduler_loop() -> None:
             try:
                 _try_fire(st, kind)
             except Exception as exc:
-                _log(f"定时器异常（{kind}）: {exc}")
+                _log(f"定时器异常（{kind}），请查看本机运行日志")
+                print(traceback.format_exc())
                 with _sched_lock:
                     if st["enabled"]:
                         st["next_run"] = datetime.now() + timedelta(minutes=1)
@@ -511,11 +562,47 @@ def api_config():
                 "align_source_sheet": cfg.align_source_sheet,
                 "align_header_row": cfg.align_header_row,
                 "align_headers": cfg.align_headers,
+                "align_mappings": cfg.align_mappings,
+                "align_mapping_profiles": cfg.align_mapping_profiles,
                 "align_schedule_enabled": cfg.align_schedule_enabled,
                 "align_schedule_minutes": cfg.align_schedule_minutes,
                 "align_schedule_only_if_changed": cfg.align_schedule_only_if_changed,
                 "vd_schedule_enabled": cfg.vd_schedule_enabled,
                 "vd_schedule_minutes": cfg.vd_schedule_minutes,
+                "vd_source_url": cfg.vd_source_url,
+                "vd_source_sheet": cfg.vd_source_sheet,
+                "vd_source_sheets": cfg.vd_source_sheets,
+                "vd_start_row": cfg.vd_start_row,
+                "vd_col_date": cfg.vd_col_date,
+                "vd_col_link": cfg.vd_col_link,
+                "vd_col_name": cfg.vd_col_name,
+                "vd_col_type": cfg.vd_col_type,
+                "vd_types": cfg.vd_types,
+                "vd_dest_url": cfg.vd_dest_url,
+                "vd_log_sheet": cfg.vd_log_sheet,
+                "vd_report_sheet": cfg.vd_report_sheet,
+                "vd_out_start_row": cfg.vd_out_start_row,
+                "vd_include_headers": cfg.vd_include_headers,
+                "vd_unit_seconds": cfg.vd_unit_seconds,
+                "vd_count_mode": cfg.vd_count_mode,
+                "vd_start_date": cfg.vd_start_date,
+                "vd_end_date": cfg.vd_end_date,
+                "vd_batch_size": cfg.vd_batch_size,
+                "vd_date_filter_enabled": cfg.vd_date_filter_enabled,
+                "vd_type_filter_mode": cfg.vd_type_filter_mode,
+                "vd_write_log": cfg.vd_write_log,
+                "vd_columns": cfg.vd_columns,
+                "catalog_index_url": cfg.catalog_index_url,
+                "catalog_index_sheet": cfg.catalog_index_sheet,
+                "catalog_start_row": cfg.catalog_start_row,
+                "catalog_url_col": cfg.catalog_url_col,
+                "catalog_sheet_col": cfg.catalog_sheet_col,
+                "catalog_target_url": cfg.catalog_target_url,
+                "catalog_output_sheet": cfg.catalog_output_sheet,
+                "catalog_output_start_row": cfg.catalog_output_start_row,
+                "catalog_keep_each_header": cfg.catalog_keep_each_header,
+                "ui_menus": cfg.ui_menus,
+                "ui_active_menu": cfg.ui_active_menu,
                 "cf_publish_url": cfg.cf_publish_url,
                 "cf_publish_secret": cfg.cf_publish_secret,
                 "cf_publish_after_sync": cfg.cf_publish_after_sync,
@@ -583,9 +670,7 @@ def start_publish_job(cfg: Config) -> str | None:
             )
             _job["result"] = {"ok": True, "mode": "cloudflare", **result}
         except Exception as e:
-            _job["error"] = str(e)
-            _log(f"失败: {e}")
-            print(traceback.format_exc())
+            _record_job_failure(e, "发布")
         finally:
             _job["running"] = False
             _job["finished_at"] = datetime.now().strftime("%H:%M:%S")
@@ -601,8 +686,8 @@ def start_align_job(cfg: Config, from_schedule: bool = False) -> str | None:
         return "请至少填写一个数据源表格链接"
     if not cfg.align_target_url:
         return "请填写目标表链接"
-    if not cfg.align_headers:
-        return "请配置规范表头（一行一个）"
+    if not (cfg.align_mappings or cfg.align_headers):
+        return "请配置字段映射"
     if not _job_lock.acquire(blocking=False):
         return "正在运行中，请等当前任务结束"
     save_config(cfg)
@@ -618,9 +703,7 @@ def _run_video_job(cfg: Config, from_schedule: bool = False) -> None:
         result = run_video_duration(cfg, log=_log)
         _job["result"] = result
     except Exception as e:
-        _job["error"] = str(e)
-        _log(f"失败: {e}")
-        print(traceback.format_exc())
+        _record_job_failure(e, "视频汇总")
     finally:
         _job["running"] = False
         _job["finished_at"] = datetime.now().strftime("%H:%M:%S")
@@ -639,6 +722,40 @@ def start_video_job(cfg: Config) -> str | None:
     _reset_job()
     threading.Thread(target=_run_video_job, args=(cfg, False), daemon=True).start()
     return None
+
+
+def _run_catalog_job(cfg: Config) -> None:
+    try:
+        _job["result"] = run_catalog_merge(cfg, log=_log)
+    except Exception as e:
+        _record_job_failure(e, "目录汇总")
+    finally:
+        _job["running"] = False
+        _job["finished_at"] = datetime.now().strftime("%H:%M:%S")
+        if _job_lock.locked():
+            _job_lock.release()
+
+
+def start_catalog_job(cfg: Config) -> str | None:
+    if not cfg.catalog_index_url:
+        return "请填写目录表链接"
+    if not cfg.catalog_target_url:
+        return "请填写目标表链接"
+    if not _job_lock.acquire(blocking=False):
+        return "正在运行中，请等当前任务结束"
+    save_config(cfg)
+    _reset_job()
+    threading.Thread(target=_run_catalog_job, args=(cfg,), daemon=True).start()
+    return None
+
+
+@app.post("/api/run-catalog")
+def api_run_catalog():
+    cfg = _cfg_from_payload(request.get_json(force=True) or {})
+    err = start_catalog_job(cfg)
+    if err:
+        return jsonify({"ok": False, "error": err}), 409 if "运行中" in err else 400
+    return jsonify({"ok": True})
 
 
 @app.post("/api/run-video")
@@ -705,8 +822,7 @@ def _run_align_job(cfg: Config, from_schedule: bool = False) -> None:
         result = run_align_sync(cfg, log=_log)
         _job["result"] = result
     except Exception as e:
-        _job["error"] = str(e)
-        _log(f"失败: {e}")
+        _record_job_failure(e, "字段映射")
     finally:
         _job["running"] = False
         _job["finished_at"] = datetime.now().strftime("%H:%M:%S")
@@ -721,8 +837,8 @@ def api_run_align():
         return jsonify({"ok": False, "error": "请至少填写一个数据源表格链接"}), 400
     if not cfg.align_target_url:
         return jsonify({"ok": False, "error": "请填写目标表链接"}), 400
-    if not cfg.align_headers:
-        return jsonify({"ok": False, "error": "请配置规范表头（一行一个）"}), 400
+    if not (cfg.align_mappings or cfg.align_headers):
+        return jsonify({"ok": False, "error": "请配置字段映射"}), 400
     if not _job_lock.acquire(blocking=False):
         return jsonify({"ok": False, "error": "正在运行中，请等当前任务结束"}), 409
     save_config(cfg)
@@ -789,12 +905,28 @@ def api_align_schedule():
     if enabled:
         if not cfg.align_sources:
             return jsonify({"ok": False, "error": "定时前请先填好数据源链接和工作表名称"}), 400
-        if not cfg.align_target_url or not cfg.align_headers:
-            return jsonify({"ok": False, "error": "定时前请先填好目标表和规范表头"}), 400
+        if not cfg.align_target_url or not (cfg.align_mappings or cfg.align_headers):
+            return jsonify({"ok": False, "error": "定时前请先填好目标表和字段映射"}), 400
         start_align_scheduler(cfg.align_schedule_minutes, cfg.align_schedule_only_if_changed)
     else:
         stop_align_scheduler()
     return jsonify({"ok": True, "align_schedule": _align_schedule_snapshot()})
+
+
+@app.post("/api/video-schedule")
+def api_video_schedule():
+    data = request.get_json(force=True) or {}
+    cfg = _cfg_from_payload(data)
+    enabled = bool(data.get("vd_schedule_enabled"))
+    cfg.vd_schedule_enabled = enabled
+    save_config(cfg)
+    if enabled:
+        if not cfg.vd_source_url or not cfg.vd_dest_url:
+            return jsonify({"ok": False, "error": "定时前请先填好源表和目标表链接"}), 400
+        start_video_scheduler(cfg.vd_schedule_minutes)
+    else:
+        stop_video_scheduler()
+    return jsonify({"ok": True, "video_schedule": _video_schedule_snapshot()})
 
 
 @app.get("/api/status")

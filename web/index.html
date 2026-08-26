@@ -1,282 +1,64 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="zh-CN">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>数据汇总工具</title>
   <link rel="icon" href="/static/logo.png" />
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
   <header class="top">
-    <div class="brand">
-      <img class="logo" src="/static/logo.png" alt="" width="56" height="56" />
-      <div>
-        <h1>数据汇总工具</h1>
-        <p>筛选汇总，或按表头对齐原样拷贝。两个功能分开，互不影响。</p>
-      </div>
-    </div>
-    <div class="sa" id="saBox">
-      <span class="sa-label">服务账号（源表和目标表都要共享给它 · 编辑者）</span>
-      <code id="saEmail">读取中…</code>
-      <button type="button" class="ghost" id="copySa">复制</button>
-    </div>
+    <div class="brand"><img class="logo" src="/static/logo.png" alt="" /><div><h1>数据汇总工具</h1><p>不同汇总任务分开配置，菜单名称和配置均可独立保存。</p></div></div>
+    <div class="sa"><span class="sa-label">服务账号（源表和目标表都要共享给它 · 编辑者）</span><code id="saEmail">读取中…</code><button class="ghost" id="copySa" type="button">复制</button></div>
   </header>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="side-head"><strong>配置菜单</strong><button class="icon-btn" id="addMenu" type="button" title="新增配置">＋</button></div>
+      <nav id="menuList" class="menu-list"></nav>
+      <p class="side-note">双击名称可修改。新增菜单时选择模板，每个菜单保存独立配置。</p>
+    </aside>
+    <main class="workspace">
+      <section class="workspace-head"><div><span class="eyebrow" id="templateLabel">模板</span><h2 id="workspaceTitle">贴文筛选汇总</h2></div><div class="head-actions"><button class="ghost" id="renameMenu" type="button">修改名称</button><button class="ghost danger" id="deleteMenu" type="button">删除配置</button></div></section>
 
-  <nav class="tabs">
-    <button type="button" class="tab on" data-tab="filter">贴文筛选汇总</button>
-    <button type="button" class="tab" data-tab="align">表头对齐同步</button>
-  </nav>
+      <div id="panel-filter" class="template-panel">
+        <div class="top-actions"><button class="primary" id="runBtn" type="button">开始汇总</button><button class="ghost" id="publishCfBtn" type="button">发布图库</button><button class="ghost save-template" type="button">保存配置</button><a id="openTarget" class="ghost linkbtn" href="#" target="_blank" hidden>打开全部结果表</a><a id="openHot" class="ghost linkbtn" href="#" target="_blank" hidden>打开高赞表</a></div>
+        <section class="card"><h2>1. 数据源表格链接</h2><p class="note">每个源表使用同一套字段映射，小组名可选。</p><div class="src-table"><div class="src-head"><span>小组（可选）</span><span>表格链接</span><span></span></div><div id="sourceRows"></div></div><div class="hint-row"><span id="sourceCount">0 个链接</span><div><button class="ghost" id="addSource" type="button">+ 添加</button><button class="ghost" id="clearSources" type="button">清空</button></div></div><label class="check"><input id="add_source_column" type="checkbox" checked />把小组写到 AC 列</label></section>
+        <section class="card"><h2>2. 日期与点赞过滤</h2><div class="row3"><label>开始日期<input id="start_date" type="date" /></label><label>结束日期<input id="end_date" type="date" /></label><label>点赞阈值<input id="likes_threshold" type="number" min="0" value="1000" /></label></div></section>
+        <section class="card"><h2>3. 写入结果</h2><label class="check"><input id="upsert_by_id" type="checkbox" checked />按 B 列帖文 id 增量更新</label><div class="dest-box"><label class="check"><input id="write_all" type="checkbox" checked /><strong>全部结果</strong></label><label>表格链接<input id="target_url" type="text" /></label><div class="row3"><label>工作表名<input id="output_sheet" type="text" value="筛选结果" /></label><label>起始行<input id="output_start_row" type="number" min="1" value="1" /></label><label class="check"><input id="include_headers" type="checkbox" checked />写入表头</label></div></div><hr class="split" /><div class="dest-box"><label class="check"><input id="write_hot" type="checkbox" checked /><strong>高赞结果</strong></label><label>表格链接<input id="hot_target_url" type="text" placeholder="留空 = 使用全部结果表" /></label><div class="row3"><label>工作表名<input id="hot_output_sheet" type="text" value="点赞1000以上" /></label><label>起始行<input id="hot_start_row" type="number" min="1" value="1" /></label><label class="check"><input id="hot_include_headers" type="checkbox" checked />写入表头</label></div></div></section>
+        <section class="card"><h2>4. 发布图库</h2><label>发布地址<input id="cf_publish_url" type="text" /></label><label>发布密钥<input id="cf_publish_secret" type="password" /></label><div class="row3"><label>发布数据<select id="cf_publish_source"><option value="all">全部结果</option><option value="hot">高赞结果</option></select></label><label class="check"><input id="cf_publish_after_sync" type="checkbox" />汇总后自动发布</label><span></span></div></section>
+        <section class="card"><h2>5. 定时同步</h2><div class="row3"><label>间隔（分钟）<input id="schedule_minutes" type="number" min="5" value="1440" /></label><label class="check"><input id="schedule_only_if_changed" type="checkbox" checked />仅源表变化时执行</label><label class="check"><input id="schedule_enabled" type="checkbox" />启用定时</label></div><div class="hint-row"><span id="schedInfo">定时未启动</span><button class="ghost" id="schedBtn" type="button">保存并启动定时</button></div></section>
+        <section class="card"><h2>6. 抓取字段</h2><div class="field-table"><div class="field-head"><span>字段名</span><span>工作表</span><span>范围</span><span></span></div><div id="fieldRows"></div></div><div class="hint-row"><span id="fieldCount">0 列</span><div><button class="ghost" id="addField" type="button">+ 添加字段</button><button class="ghost" id="resetFields" type="button">恢复默认</button></div></div></section>
+        <section class="card"><h2>7. 高级设置</h2><label>服务账号 JSON 路径<input id="credentials_file" type="text" /></label><div class="row3"><label>排除帖文 id<input id="exclude_id_value" type="text" value="未找到" /></label><label>日期字段<input id="date_field" type="text" value="发布日期" /></label><label>排序字段<input id="sort_field" type="text" value="点赞" /></label></div><label class="check"><input id="sort_descending" type="checkbox" checked />降序排列</label></section>
+      </div>
 
-  <main>
-    <div id="tab-filter">
-    <section class="card">
-      <h2>1. 数据源表格链接 <em>只换链接，列范围相同</em></h2>
-      <p class="note">每个源表都是同一套表头（当月贴文库）。小组名可选，用来写进汇总结果。</p>
-      <div class="src-table">
-        <div class="src-head">
-          <span>小组（可选）</span>
-          <span>表格链接</span>
-          <span></span>
-        </div>
-        <div id="sourceRows"></div>
+      <div id="panel-catalog" class="template-panel" hidden>
+        <div class="top-actions"><button class="primary" id="runCatalogBtn" type="button">开始目录汇总</button><button class="ghost save-template" type="button">保存配置</button><a id="openCatalog" class="ghost linkbtn" href="#" target="_blank" hidden>打开目标表</a></div>
+        <section class="card"><h2>1. 目录表</h2><p class="note">遍历目录表中的链接，并在每个链接中查找同一行指定的工作表。</p><label>目录表链接<input id="catalog_index_url" type="text" /></label><div class="row3"><label>目录工作表名<input id="catalog_index_sheet" type="text" placeholder="留空读取第一个" /></label><label>数据起始行<input id="catalog_start_row" type="number" min="1" value="2" /></label><span></span></div><div class="row3"><label>链接所在列<input id="catalog_url_col" type="text" value="B" /></label><label>工作表名称所在列<input id="catalog_sheet_col" type="text" value="D" /></label><label class="check"><input id="catalog_keep_each_header" type="checkbox" />每个工作表都保留首行</label></div></section>
+        <section class="card"><h2>2. 写入目标表</h2><label>目标表格链接<input id="catalog_target_url" type="text" /></label><div class="row3"><label>工作表名<input id="catalog_output_sheet" type="text" value="目录汇总" /></label><label>起始行<input id="catalog_output_start_row" type="number" min="1" value="1" /></label><span></span></div><p class="note">源工作表有多少列就读取多少列，目标表按最大列数自动扩展。</p></section>
       </div>
-      <div class="hint-row">
-        <span id="sourceCount">0 个链接</span>
-        <div>
-          <button type="button" class="ghost" id="addSource">+ 添加数据源</button>
-          <button type="button" class="ghost" id="clearSources">清空</button>
-        </div>
-      </div>
-      <label class="check">
-        <input id="add_source_column" type="checkbox" checked />
-        把「小组」写到 AC 列（不占用 A 列）
-      </label>
-    </section>
 
-    <section class="card">
-      <h2>2. 日期与点赞过滤</h2>
-      <div class="row3">
-        <label>开始日期 <input id="start_date" type="date" /></label>
-        <label>结束日期 <input id="end_date" type="date" /></label>
-        <label>点赞阈值 <input id="likes_threshold" type="number" min="0" value="1000" /></label>
+      <div id="panel-align" class="template-panel" hidden>
+        <div class="top-actions"><button class="primary" id="runAlignBtn" type="button">开始对齐同步</button><button class="ghost save-template" type="button">保存配置</button><a id="openAlign" class="ghost linkbtn" href="#" target="_blank" hidden>打开目标表</a></div>
+        <section class="card"><h2>1. 数据源</h2><div class="src-table"><div class="src-head"><span>工作表名称</span><span>表格链接</span><span></span></div><div id="alignSourceRows"></div></div><div class="hint-row"><span id="alignSourceCount">0 个链接</span><div><button class="ghost" id="addAlignSource" type="button">+ 添加</button><button class="ghost" id="clearAlignSources" type="button">清空</button></div></div><div class="row3"><label>默认工作表名<input id="align_source_sheet" type="text" /></label><label>表头所在行<input id="align_header_row" type="number" min="1" value="1" /></label><span></span></div></section>
+        <section class="card"><h2>2. 字段映射</h2><p class="note">目标字段是写入列名，源字段是源表中的表头；默认两者相同。可切换某个链接并单独覆盖。</p><div class="mapping-toolbar"><label>配置范围<select id="mappingProfile"><option value="__default__">所有链接的默认映射</option></select></label><button class="ghost" id="peekHeaders" type="button">从当前源读取表头</button></div><div class="mapping-table"><div class="mapping-head"><span>目标字段</span><span>源字段</span><span></span></div><div id="mappingRows"></div></div><div class="hint-row"><span id="mappingCount">0 个字段</span><button class="ghost" id="addMapping" type="button">+ 添加映射</button></div></section>
+        <section class="card"><h2>3. 目标表</h2><label>目标表格链接<input id="align_target_url" type="text" /></label><div class="row3"><label>工作表名<input id="align_output_sheet" type="text" value="对齐结果" /></label><label>起始行<input id="align_start_row" type="number" min="1" value="1" /></label><label class="check"><input id="align_include_headers" type="checkbox" checked />写入表头</label></div></section>
+        <section class="card"><h2>4. 定时同步</h2><div class="row3"><label>间隔（分钟）<input id="align_schedule_minutes" type="number" min="5" value="60" /></label><label class="check"><input id="align_schedule_only_if_changed" type="checkbox" checked />仅源表变化时执行</label><label class="check"><input id="align_schedule_enabled" type="checkbox" />启用定时</label></div><div class="hint-row"><span id="alignSchedInfo">定时未启动</span><button class="ghost" id="alignSchedBtn" type="button">保存并启动定时</button></div></section>
       </div>
-      <p class="note">日期先筛一遍；高赞表再取点赞 ≥ 阈值的行。默认按 B 列帖文id 增量更新：已有行只改有变动的列（如 D 列引流），新 id 追加，不整表覆盖。</p>
-    </section>
 
-    <section class="card">
-      <h2>3. 写入结果（两套配置互不影响）</h2>
-      <label class="check">
-        <input id="upsert_by_id" type="checkbox" checked />
-        按 B 列帖文id 更新（已有行只改变化的列，新 id 追加；取消则整表覆盖）
-      </label>
-      <div class="dest-box">
-        <label class="check">
-          <input id="write_all" type="checkbox" checked />
-          <strong>全部结果</strong>（日期筛选后的所有行）
-        </label>
-        <label>
-          表格链接
-          <input id="target_url" type="text" spellcheck="false"
-            placeholder="https://docs.google.com/spreadsheets/d/……/edit" />
-        </label>
-        <div class="row3">
-          <label>工作表名 <input id="output_sheet" type="text" value="筛选结果" /></label>
-          <label>起始行 <input id="output_start_row" type="number" min="1" value="1" /></label>
-          <label class="check"><input id="include_headers" type="checkbox" checked /> 写入表头</label>
-        </div>
+      <div id="panel-video" class="template-panel" hidden>
+        <div class="top-actions"><button class="primary" id="runVideoBtn" type="button">开始提取并汇总</button><button class="ghost save-template" type="button">保存配置</button><a id="openVideo" class="ghost linkbtn" href="#" target="_blank" hidden>打开数据表</a></div>
+        <section class="card"><h2>1. 源表与工作表</h2><label>源表格链接<input id="vd_source_url" type="text" /></label><label>工作表名称（可多选，一行一个）<textarea id="vd_source_sheets" rows="4" placeholder="8月份&#10;9月份"></textarea></label><label>数据起始行<input id="vd_start_row" type="number" min="1" value="2" /></label></section>
+        <section class="card"><h2>2. 源表列映射</h2><p class="note">日期、视频链接、名字各保留一项；类型/分类可以继续添加，多项会组合成分类名称。</p><div class="vd-map-head"><span>字段名称</span><span>用途</span><span>源表列</span><span></span></div><div id="vdColumnRows"></div><div class="hint-row"><span>列字母可自由修改</span><button class="ghost" id="addVdColumn" type="button">+ 添加分类列</button></div><input id="vd_col_date" type="hidden" value="A" /><input id="vd_col_link" type="hidden" value="B" /><input id="vd_col_name" type="hidden" value="H" /><input id="vd_col_type" type="hidden" value="E" /></section>
+        <section class="card"><h2>3. 筛选</h2><label class="check"><input id="vd_date_filter_enabled" type="checkbox" checked />启用日期筛选；不勾选则处理全部日期</label><div class="row3"><label>开始日期<input id="vd_start_date" type="date" /></label><label>结束日期<input id="vd_end_date" type="date" /></label><span></span></div><div class="row3"><label>类型操作<select id="vd_type_filter_mode"><option value="include">只包含这些类型</option><option value="exclude">排除这些类型</option><option value="all">不筛选类型</option></select></label><label class="span2">类型（一行一个，可增减）<textarea id="vd_types" rows="4"></textarea></label></div></section>
+        <section class="card"><h2>4. 写入分类数据表</h2><label>目标表格链接<input id="vd_dest_url" type="text" /></label><div class="row3"><label>数据工作表名<input id="vd_report_sheet" type="text" value="数据表" /></label><label>输出起始行<input id="vd_out_start_row" type="number" min="1" value="1" /></label><label>计数方式<select id="vd_count_mode"><option value="divide_total">总秒数 ÷ 30</option><option value="per_video_ceil">按每条原视频阶梯计数</option></select></label></div><div class="row3"><label>换算单位（秒）<input id="vd_unit_seconds" type="number" min="1" value="30" /></label><label>每批处理数<input id="vd_batch_size" type="number" min="20" value="100" /></label><span></span></div><input id="vd_write_log" type="checkbox" hidden /><input id="vd_log_sheet" type="hidden" value="日志表" /><label class="check"><input id="vd_include_headers" type="checkbox" checked />首次生成时设置表头和紧凑样式</label><p class="note">只写数据表：第 1 行姓名（按分类列合并）、第 3 行类型、第 5 行汇总、第 8 行起为每日数据；刷新保留姓名顺序和已修改样式。</p></section>
+        <section class="card"><h2>5. 定时执行</h2><div class="row3"><label>间隔（分钟）<input id="vd_schedule_minutes" type="number" min="5" value="180" /></label><label class="check"><input id="vd_schedule_enabled" type="checkbox" />启用定时</label><span></span></div><div class="hint-row"><span id="videoSchedInfo">定时未启动</span><button class="ghost" id="videoSchedBtn" type="button">保存并启动定时</button></div></section>
       </div>
-      <hr class="split" />
-      <div class="dest-box">
-        <label class="check">
-          <input id="write_hot" type="checkbox" checked />
-          <strong>高赞结果</strong>（点赞 ≥ 阈值）
-        </label>
-        <label>
-          表格链接 <span class="hint">可与上面同一张表，也可另填一张</span>
-          <input id="hot_target_url" type="text" spellcheck="false"
-            placeholder="留空 = 与全部结果同一张表" />
-        </label>
-        <div class="row3">
-          <label>工作表名 <input id="hot_output_sheet" type="text" value="点赞1000以上" /></label>
-          <label>起始行 <input id="hot_start_row" type="number" min="1" value="1" /></label>
-          <label class="check"><input id="hot_include_headers" type="checkbox" checked /> 写入表头</label>
-        </div>
-      </div>
-    </section>
 
-    <section class="card">
-      <h2>4. 发布到 Cloudflare <em>替代谷歌脚本推 CDN</em></h2>
-      <p class="note">
-        建议每天最多发布一次。图库页面读的是 CDN，不走 Functions。
-        不要点站点上的「刷新CDN」。数据和上次相同时会自动跳过，避免占免费配额。
-      </p>
-      <label>
-        发布地址
-        <input id="cf_publish_url" type="text" spellcheck="false"
-          value="https://promo.zhixianglife.com/api/publish-cache" />
-      </label>
-      <label>
-        CACHE_PUBLISH_SECRET
-        <input id="cf_publish_secret" type="password" spellcheck="false" placeholder="Cloudflare 后台的发布密钥" />
-      </label>
-      <div class="row3">
-        <label>发布哪份数据
-          <select id="cf_publish_source">
-            <option value="all">全部结果</option>
-            <option value="hot">高赞结果</option>
-          </select>
-        </label>
-        <label class="check"><input id="cf_publish_after_sync" type="checkbox" /> 汇总后自动发布</label>
-        <span></span>
-      </div>
-      <div class="hint-row">
-        <span>密钥只保存在本机 config.json，不会写进仓库</span>
-        <button type="button" class="ghost" id="publishCfBtn">立即发布到 Cloudflare</button>
-      </div>
-    </section>
-
-    <section class="card">
-      <h2>5. 定时同步 <em>关掉窗口就不再跑</em></h2>
-      <p class="note">每天打开一次即可。默认间隔 1440 分钟（1 天）。打开后若已到期会先跑一轮。勾选「仅源表变化时执行」则没改动就跳过。不要勾选「汇总后自动发布」——整表推 Cloudflare 约 100 次 Functions，请用上面的按钮每天点一次。</p>
-      <div class="row3">
-        <label>间隔（分钟） <input id="schedule_minutes" type="number" min="5" value="1440" /></label>
-        <label class="check"><input id="schedule_only_if_changed" type="checkbox" checked /> 仅源表有变化时执行</label>
-        <label class="check"><input id="schedule_enabled" type="checkbox" /> 启用定时</label>
-      </div>
-      <div class="hint-row">
-        <span id="schedInfo">定时未启动</span>
-        <button type="button" class="ghost" id="schedBtn">保存并启动定时</button>
-      </div>
-    </section>
-
-    <section class="card">
-      <button type="button" class="collapse-btn" id="fieldsBtn">6. 抓取字段（默认按截图，可改） ▾</button>
-      <div id="fieldsPanel" class="more" hidden>
-        <p class="note">对应「数据库」里的 D 列范围。以后换列，改这里即可，不必再给配置表。</p>
-        <div class="field-table">
-          <div class="field-head">
-            <span>字段名</span>
-            <span>工作表</span>
-            <span>范围</span>
-            <span></span>
-          </div>
-          <div id="fieldRows"></div>
-        </div>
-        <div class="hint-row">
-          <span id="fieldCount">0 列</span>
-          <div>
-            <button type="button" class="ghost" id="addField">+ 添加字段</button>
-            <button type="button" class="ghost" id="resetFields">恢复截图默认</button>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <section class="card collapse">
-      <button type="button" class="collapse-btn" id="moreBtn">高级选项 ▾</button>
-      <div id="morePanel" class="more" hidden>
-        <label>服务账号 JSON 路径 <input id="credentials_file" type="text" spellcheck="false" /></label>
-        <div class="row3">
-          <label>排除帖文id <input id="exclude_id_value" type="text" value="未找到" /></label>
-          <label>日期字段 <input id="date_field" type="text" value="发布日期" /></label>
-          <label>排序字段 <input id="sort_field" type="text" value="点赞" /></label>
-        </div>
-        <p class="note">排序字段改成哪个字段名，汇总就按那一列排。下面勾选为降序，取消则升序。</p>
-        <label class="check"><input id="sort_descending" type="checkbox" checked /> 降序排列</label>
-      </div>
-    </section>
-
-    <div class="actions">
-      <button type="button" class="primary" id="runBtn">开始汇总</button>
-      <button type="button" class="ghost" id="saveBtn">保存配置</button>
-      <a id="openTarget" class="ghost linkbtn" href="#" target="_blank" rel="noopener" hidden>打开全部结果表</a>
-      <a id="openHot" class="ghost linkbtn" href="#" target="_blank" rel="noopener" hidden>打开高赞表</a>
-    </div>
-    </div>
-
-    <div id="tab-align" hidden>
-    <section class="card">
-      <h2>1. 数据源表格链接</h2>
-      <p class="note">每行填一个数据源。工作表名称填源表里的 sheet 名（如 8月份、6月份）；留空则读该表格的第一个工作表。</p>
-      <div class="src-table">
-        <div class="src-head">
-          <span>工作表名称</span>
-          <span>表格链接</span>
-          <span></span>
-        </div>
-        <div id="alignSourceRows"></div>
-      </div>
-      <div class="hint-row">
-        <span id="alignSourceCount">0 个链接</span>
-        <div>
-          <button type="button" class="ghost" id="addAlignSource">+ 添加数据源</button>
-          <button type="button" class="ghost" id="clearAlignSources">清空</button>
-        </div>
-      </div>
-      <div class="row3">
-        <label>默认工作表名 <input id="align_source_sheet" type="text" placeholder="某行没填时用这个，可留空" /></label>
-        <label>表头所在行 <input id="align_header_row" type="number" min="1" value="1" /></label>
-        <span></span>
-      </div>
-    </section>
-
-    <section class="card">
-      <h2>2. 规范表头 <em>手动配置，按列名对齐</em></h2>
-      <p class="note">一行一个表头，顺序就是写入目标表的列顺序。旧表缺某列就跳过留空。</p>
-      <textarea id="align_headers" rows="10" spellcheck="false"
-        placeholder="名字&#10;帖文id&#10;FB链接&#10;发布日期&#10;点赞"></textarea>
-      <div class="hint-row">
-        <span id="alignHeaderCount">0 列</span>
-        <button type="button" class="ghost" id="peekHeaders">从第一个源表读取表头</button>
-      </div>
-    </section>
-
-    <section class="card">
-      <h2>3. 目标表</h2>
-      <label>
-        目标表格链接
-        <input id="align_target_url" type="text" spellcheck="false"
-          placeholder="https://docs.google.com/spreadsheets/d/……/edit" />
-      </label>
-      <div class="row3">
-        <label>工作表名 <input id="align_output_sheet" type="text" value="对齐结果" /></label>
-        <label>起始行 <input id="align_start_row" type="number" min="1" value="1" /></label>
-        <label class="check"><input id="align_include_headers" type="checkbox" checked /> 写入表头</label>
-      </div>
-    </section>
-
-    <section class="card">
-      <h2>4. 定时同步 <em>需保持本程序开着</em></h2>
-      <p class="note">到点后按上面的源表（含工作表名称）重新对齐写入。勾选「仅源表变化时执行」则没改动就跳过。</p>
-      <div class="row3">
-        <label>间隔（分钟） <input id="align_schedule_minutes" type="number" min="5" value="60" /></label>
-        <label class="check"><input id="align_schedule_only_if_changed" type="checkbox" checked /> 仅源表有变化时执行</label>
-        <label class="check"><input id="align_schedule_enabled" type="checkbox" /> 启用定时</label>
-      </div>
-      <div class="hint-row">
-        <span id="alignSchedInfo">定时未启动</span>
-        <button type="button" class="ghost" id="alignSchedBtn">保存并启动定时</button>
-      </div>
-    </section>
-
-    <div class="actions">
-      <button type="button" class="primary" id="runAlignBtn">开始对齐同步</button>
-      <button type="button" class="ghost" id="saveAlignBtn">保存配置</button>
-      <a id="openAlign" class="ghost linkbtn" href="#" target="_blank" rel="noopener" hidden>打开目标表</a>
-    </div>
-    </div>
-
-    <section class="card log-card">
-      <div class="log-head">
-        <h2>运行日志</h2>
-        <span id="jobState" class="badge idle">待命</span>
-      </div>
-      <pre id="log" class="log"></pre>
-      <p id="summary" class="summary" hidden></p>
-    </section>
-  </main>
-
+      <section class="card log-card"><div class="log-head"><h2>运行日志</h2><span id="jobState" class="badge idle">待命</span></div><pre id="log" class="log"></pre><p id="summary" class="summary" hidden></p></section>
+    </main>
+  </div>
+  <dialog id="menuDialog"><form method="dialog"><h3>新增配置菜单</h3><label>菜单名称<input id="newMenuName" type="text" /></label><label>选择模板<select id="newMenuTemplate"><option value="filter">贴文筛选汇总</option><option value="catalog">目录表驱动汇总</option><option value="align">字段映射 / 表头对齐</option><option value="video">自定义视频分类汇总</option></select></label><div class="dialog-actions"><button class="ghost" value="cancel">取消</button><button class="primary" id="confirmAddMenu" value="default">新增</button></div></form></dialog>
   <script src="/static/app.js"></script>
 </body>
 </html>

@@ -1,584 +1,399 @@
 const $ = (id) => document.getElementById(id);
 
-const fields = [
-  "target_url",
-  "hot_target_url",
-  "output_sheet",
-  "hot_output_sheet",
-  "output_start_row",
-  "hot_start_row",
-  "start_date",
-  "end_date",
-  "likes_threshold",
-  "schedule_minutes",
-  "credentials_file",
-  "exclude_id_value",
-  "date_field",
-  "sort_field",
-  "align_target_url",
-  "align_output_sheet",
-  "align_start_row",
-  "align_source_sheet",
-  "align_header_row",
-  "align_schedule_minutes",
-  "cf_publish_url",
-  "cf_publish_secret",
-  "cf_publish_source",
-];
+const templateNames = {
+  filter: "贴文筛选汇总",
+  catalog: "目录表驱动汇总",
+  align: "字段映射 / 表头对齐",
+  video: "自定义视频分类汇总",
+};
 
-const checks = [
-  "include_headers",
-  "hot_include_headers",
-  "add_source_column",
-  "sort_descending",
-  "write_all",
-  "write_hot",
-  "upsert_by_id",
-  "schedule_enabled",
-  "schedule_only_if_changed",
-  "align_include_headers",
-  "align_schedule_enabled",
-  "align_schedule_only_if_changed",
-  "cf_publish_after_sync",
-];
+const scalarFields = {
+  filter: ["credentials_file", "target_url", "hot_target_url", "output_sheet", "hot_output_sheet", "output_start_row", "hot_start_row", "start_date", "end_date", "likes_threshold", "schedule_minutes", "exclude_id_value", "date_field", "sort_field", "cf_publish_url", "cf_publish_secret", "cf_publish_source"],
+  catalog: ["catalog_index_url", "catalog_index_sheet", "catalog_start_row", "catalog_url_col", "catalog_sheet_col", "catalog_target_url", "catalog_output_sheet", "catalog_output_start_row"],
+  align: ["align_target_url", "align_output_sheet", "align_start_row", "align_source_sheet", "align_header_row", "align_schedule_minutes"],
+  video: ["vd_source_url", "vd_source_sheets", "vd_start_row", "vd_col_date", "vd_col_link", "vd_col_name", "vd_col_type", "vd_types", "vd_start_date", "vd_end_date", "vd_type_filter_mode", "vd_dest_url", "vd_report_sheet", "vd_log_sheet", "vd_out_start_row", "vd_count_mode", "vd_unit_seconds", "vd_batch_size", "vd_schedule_minutes"],
+};
+
+const checkFields = {
+  filter: ["include_headers", "hot_include_headers", "add_source_column", "sort_descending", "write_all", "write_hot", "upsert_by_id", "schedule_enabled", "schedule_only_if_changed", "cf_publish_after_sync"],
+  catalog: ["catalog_keep_each_header"],
+  align: ["align_include_headers", "align_schedule_enabled", "align_schedule_only_if_changed"],
+  video: ["vd_date_filter_enabled", "vd_write_log", "vd_include_headers", "vd_schedule_enabled"],
+};
 
 let defaultFields = [];
+let menus = [];
+let activeId = "";
+let renderedId = "";
+let currentMappingKey = "__default__";
+let defaultMappings = [];
+let mappingProfiles = {};
+let pollTimer = null;
 
-function namePlaceholder(containerId) {
-  return containerId === "alignSourceRows" ? "例如：8月份" : "例如：管理组";
+function newId(template) {
+  return `${template}-${Date.now()}-${Math.random().toString(16).slice(2, 7)}`;
 }
 
-function addSourceRowTo(containerId, name, url, onCount) {
-  const wrap = document.createElement("div");
-  wrap.className = "src-row";
-  const ph = namePlaceholder(containerId);
-  wrap.innerHTML =
-    `<input class="src-name" type="text" placeholder="${ph}" />` +
-    `<input class="src-url" type="text" spellcheck="false" placeholder="https://docs.google.com/spreadsheets/d/……/edit" />` +
-    `<button type="button" class="ghost src-del">删除</button>`;
-  wrap.querySelector(".src-name").value = name || "";
-  wrap.querySelector(".src-url").value = url || "";
-  wrap.querySelector(".src-del").addEventListener("click", () => {
-    wrap.remove();
-    const box = $(containerId);
-    if (!box.children.length) addSourceRowTo(containerId, "", "", onCount);
-    if (onCount) onCount();
+function defaultMenusFromConfig(cfg) {
+  return Object.keys(templateNames).map((template) => ({
+    id: `${template}-default`,
+    name: templateNames[template],
+    template,
+    settings: collectInitialSettings(cfg, template),
+  }));
+}
+
+function collectInitialSettings(cfg, template) {
+  const result = {};
+  [...(scalarFields[template] || []), ...(checkFields[template] || [])].forEach((key) => {
+    if (cfg[key] !== undefined) result[key] = cfg[key];
   });
-  wrap.querySelector(".src-url").addEventListener("input", () => onCount && onCount());
-  $(containerId).appendChild(wrap);
-  if (onCount) onCount();
-}
-
-function readSourcesFrom(containerId) {
-  const isAlign = containerId === "alignSourceRows";
-  return [...$(containerId).querySelectorAll(".src-row")]
-    .map((row) => {
-      const label = row.querySelector(".src-name").value.trim();
-      const url = row.querySelector(".src-url").value.trim();
-      return isAlign ? { sheet: label, url } : { name: label, url };
-    })
-    .filter((s) => s.url);
-}
-
-function setSourcesTo(containerId, list, onCount) {
-  $(containerId).innerHTML = "";
-  const items = Array.isArray(list) ? list : [];
-  if (!items.length) {
-    addSourceRowTo(containerId, "", "", onCount);
-    addSourceRowTo(containerId, "", "", onCount);
-    return;
+  if (template === "filter") {
+    result.sources = cfg.sources || cfg.source_urls || [];
+    result.fields = cfg.fields || [];
   }
-  items.forEach((s) => {
-    if (typeof s === "string") addSourceRowTo(containerId, "", s, onCount);
-    else addSourceRowTo(containerId, s.sheet || s.name || "", s.url || "", onCount);
+  if (template === "align") {
+    result.align_sources = cfg.align_sources || [];
+    result.align_mappings = cfg.align_mappings || (cfg.align_headers || []).map((name) => ({ target: name, source: name }));
+    result.align_mapping_profiles = cfg.align_mapping_profiles || {};
+  }
+  if (template === "video") result.vd_columns = cfg.vd_columns || [];
+  return result;
+}
+
+function activeMenu() {
+  return menus.find((item) => item.id === activeId) || menus[0];
+}
+
+function setState(kind, text) {
+  $("jobState").className = `badge ${kind}`;
+  $("jobState").textContent = text;
+}
+
+function showMessage(text, bad = false) {
+  $("summary").hidden = false;
+  $("summary").textContent = text;
+  if (bad) setState("bad", "需要检查");
+}
+
+function renderMenus() {
+  $("menuList").innerHTML = "";
+  menus.forEach((item) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `menu-item${item.id === activeId ? " on" : ""}`;
+    button.innerHTML = `<span><strong></strong><small>${templateNames[item.template] || item.template}</small></span><span class="menu-more">›</span>`;
+    button.querySelector("strong").textContent = item.name;
+    button.addEventListener("click", () => switchMenu(item.id));
+    button.addEventListener("dblclick", (event) => { event.preventDefault(); renameActive(item.id); });
+    $("menuList").appendChild(button);
   });
 }
 
-function addSourceRow(name, url) {
-  addSourceRowTo("sourceRows", name, url, updateSourceCount);
-}
-function addAlignSourceRow(name, url) {
-  addSourceRowTo("alignSourceRows", name, url, updateAlignSourceCount);
-}
-function readSources() {
-  return readSourcesFrom("sourceRows");
-}
-function readAlignSources() {
-  return readSourcesFrom("alignSourceRows");
-}
-function setSources(list) {
-  setSourcesTo("sourceRows", list, updateSourceCount);
-}
-function setAlignSources(list) {
-  setSourcesTo("alignSourceRows", list, updateAlignSourceCount);
+function switchMenu(id) {
+  const previous = renderedId ? menus.find((item) => item.id === renderedId) : null;
+  if (previous) previous.settings = collectTemplate(previous.template);
+  activeId = id;
+  const item = activeMenu();
+  if (!item) return;
+  document.querySelectorAll(".template-panel").forEach((panel) => { panel.hidden = panel.id !== `panel-${item.template}`; });
+  $("workspaceTitle").textContent = item.name;
+  $("templateLabel").textContent = templateNames[item.template] || "模板";
+  fillTemplate(item.template, item.settings || {});
+  renderedId = id;
+  renderMenus();
 }
 
-function addFieldRow(item) {
-  const wrap = document.createElement("div");
-  wrap.className = "field-row";
-  wrap.innerHTML =
-    `<input class="f-name" type="text" placeholder="字段名" />` +
-    `<input class="f-sheet" type="text" placeholder="当月贴文库" />` +
-    `<input class="f-range" type="text" placeholder="AB2:AB" spellcheck="false" />` +
-    `<button type="button" class="ghost src-del">删除</button>`;
-  wrap.querySelector(".f-name").value = (item && item.name) || "";
-  wrap.querySelector(".f-sheet").value = (item && item.sheet) || "当月贴文库";
-  wrap.querySelector(".f-range").value = (item && item.range) || "";
-  wrap.querySelector(".src-del").addEventListener("click", () => {
-    wrap.remove();
-    if (!$("fieldRows").children.length) addFieldRow({});
-    updateFieldCount();
-  });
-  $("fieldRows").appendChild(wrap);
-  updateFieldCount();
+function renameActive(id = activeId) {
+  const item = menus.find((entry) => entry.id === id);
+  if (!item) return;
+  const value = prompt("修改菜单名称：", item.name);
+  if (value && value.trim()) {
+    item.name = value.trim();
+    if (id === activeId) $("workspaceTitle").textContent = item.name;
+    renderMenus();
+    saveConfig(true);
+  }
 }
 
-function readFieldMaps() {
-  return [...$("fieldRows").querySelectorAll(".field-row")]
-    .map((row) => ({
-      name: row.querySelector(".f-name").value.trim(),
-      sheet: row.querySelector(".f-sheet").value.trim() || "当月贴文库",
-      range: row.querySelector(".f-range").value.trim(),
-    }))
-    .filter((f) => f.name && f.range);
+function addSourceRow(containerId, item = {}) {
+  const align = containerId === "alignSourceRows";
+  const row = document.createElement("div");
+  row.className = "src-row";
+  row.innerHTML = `<input class="src-name" type="text" placeholder="${align ? "工作表名" : "小组名"}" /><input class="src-url" type="text" placeholder="https://docs.google.com/spreadsheets/d/…" /><button class="ghost src-del" type="button">删除</button>`;
+  row.querySelector(".src-name").value = item.sheet || item.name || "";
+  row.querySelector(".src-url").value = item.url || "";
+  row.querySelector(".src-del").addEventListener("click", () => { row.remove(); ensureSourceRow(containerId); updateCounts(); if (align) refreshMappingProfileOptions(); });
+  row.querySelectorAll("input").forEach((input) => input.addEventListener("input", () => { updateCounts(); if (align) refreshMappingProfileOptions(); }));
+  if (align) row.querySelectorAll("input").forEach((input) => input.addEventListener("change", () => { saveCurrentMappingProfile(); refreshMappingProfileOptions(); }));
+  $(containerId).appendChild(row);
+}
+
+function ensureSourceRow(containerId) {
+  if (!$(containerId).children.length) addSourceRow(containerId, {});
+}
+
+function setSources(containerId, list) {
+  $(containerId).innerHTML = "";
+  (Array.isArray(list) && list.length ? list : [{}, {}]).forEach((item) => addSourceRow(containerId, typeof item === "string" ? { url: item } : item));
+  updateCounts();
+}
+
+function readSources(containerId) {
+  const align = containerId === "alignSourceRows";
+  return [...$(containerId).querySelectorAll(".src-row")].map((row) => {
+    const name = row.querySelector(".src-name").value.trim();
+    const url = row.querySelector(".src-url").value.trim();
+    return align ? { sheet: name, url } : { name, url };
+  }).filter((item) => item.url);
+}
+
+function updateCounts() {
+  $("sourceCount").textContent = `${readSources("sourceRows").length} 个链接`;
+  $("alignSourceCount").textContent = `${readSources("alignSourceRows").length} 个链接`;
+  $("fieldCount").textContent = `${readFieldMaps().length} 列`;
+  $("mappingCount").textContent = `${readMappings().length} 个字段`;
+}
+
+function addFieldRow(item = {}) {
+  const row = document.createElement("div");
+  row.className = "field-row";
+  row.innerHTML = `<input class="f-name" type="text" placeholder="字段名" /><input class="f-sheet" type="text" placeholder="当月贴文库" /><input class="f-range" type="text" placeholder="AB2:AB" /><button class="ghost src-del" type="button">删除</button>`;
+  row.querySelector(".f-name").value = item.name || "";
+  row.querySelector(".f-sheet").value = item.sheet || "当月贴文库";
+  row.querySelector(".f-range").value = item.range || "";
+  row.querySelector("button").addEventListener("click", () => { row.remove(); if (!$("fieldRows").children.length) addFieldRow(); updateCounts(); });
+  $("fieldRows").appendChild(row);
 }
 
 function setFieldMaps(list) {
   $("fieldRows").innerHTML = "";
-  const items = Array.isArray(list) && list.length ? list : defaultFields;
-  if (!items.length) {
-    addFieldRow({});
-    return;
-  }
-  items.forEach((f) => addFieldRow(f));
+  (Array.isArray(list) && list.length ? list : defaultFields).forEach(addFieldRow);
+  if (!$("fieldRows").children.length) addFieldRow();
+  updateCounts();
 }
 
-function updateSourceCount() {
-  $("sourceCount").textContent = readSources().length + " 个链接";
-}
-function updateAlignSourceCount() {
-  $("alignSourceCount").textContent = readAlignSources().length + " 个链接";
-}
-function updateFieldCount() {
-  $("fieldCount").textContent = readFieldMaps().length + " 列";
-}
-function updateAlignHeaderCount() {
-  const n = $("align_headers").value.split(/\r?\n/).filter((x) => x.trim()).length;
-  $("alignHeaderCount").textContent = n + " 列";
+function readFieldMaps() {
+  return [...$("fieldRows").querySelectorAll(".field-row")].map((row) => ({ name: row.querySelector(".f-name").value.trim(), sheet: row.querySelector(".f-sheet").value.trim(), range: row.querySelector(".f-range").value.trim() })).filter((item) => item.name && item.range);
 }
 
-function payload() {
+function addMappingRow(item = {}) {
+  const row = document.createElement("div");
+  row.className = "mapping-row";
+  row.innerHTML = `<input class="map-target" type="text" placeholder="目标字段" /><input class="map-source" type="text" placeholder="源字段" /><button class="ghost" type="button">删除</button>`;
+  row.querySelector(".map-target").value = item.target || "";
+  row.querySelector(".map-source").value = item.source || item.target || "";
+  row.querySelector("button").addEventListener("click", () => { row.remove(); if (!$("mappingRows").children.length) addMappingRow(); updateCounts(); });
+  $("mappingRows").appendChild(row);
+}
+
+function setMappings(list) {
+  $("mappingRows").innerHTML = "";
+  (Array.isArray(list) && list.length ? list : [{}]).forEach(addMappingRow);
+  updateCounts();
+}
+
+function readMappings() {
+  return [...$("mappingRows").querySelectorAll(".mapping-row")].map((row) => ({ target: row.querySelector(".map-target").value.trim(), source: row.querySelector(".map-source").value.trim() || row.querySelector(".map-target").value.trim() })).filter((item) => item.target);
+}
+
+function addVdColumnRow(item = { field: "分类", role: "type", column: "" }) {
+  const row = document.createElement("div");
+  row.className = "vd-map-row";
+  row.innerHTML = `<input class="vd-field" type="text" placeholder="字段名称" /><select class="vd-role"><option value="date">日期</option><option value="link">视频链接</option><option value="name">名字</option><option value="type">类型/分类</option></select><input class="vd-column" type="text" placeholder="E" /><button class="ghost" type="button">删除</button>`;
+  row.querySelector(".vd-field").value = item.field || "分类";
+  row.querySelector(".vd-role").value = item.role || "type";
+  row.querySelector(".vd-column").value = item.column || "";
+  row.querySelector("button").addEventListener("click", () => row.remove());
+  $("vdColumnRows").appendChild(row);
+}
+
+function setVdColumns(list) {
+  $("vdColumnRows").innerHTML = "";
+  const defaults = [
+    { field: "日期", role: "date", column: "A" },
+    { field: "视频链接", role: "link", column: "B" },
+    { field: "名字", role: "name", column: "H" },
+    { field: "类型", role: "type", column: "E" },
+  ];
+  (Array.isArray(list) && list.length ? list : defaults).forEach(addVdColumnRow);
+}
+
+function readVdColumns() {
+  return [...$("vdColumnRows").querySelectorAll(".vd-map-row")].map((row) => ({ field: row.querySelector(".vd-field").value.trim() || "分类", role: row.querySelector(".vd-role").value, column: row.querySelector(".vd-column").value.trim().toUpperCase() })).filter((item) => item.column);
+}
+
+function saveCurrentMappingProfile() {
+  const value = readMappings();
+  if (currentMappingKey === "__default__") defaultMappings = value;
+  else mappingProfiles[currentMappingKey] = value;
+}
+
+function refreshMappingProfileOptions(selected = currentMappingKey) {
+  const select = $("mappingProfile");
+  select.innerHTML = `<option value="__default__">所有链接的默认映射</option>`;
+  readSources("alignSourceRows").forEach((source, index) => {
+    const option = document.createElement("option");
+    option.value = source.url;
+    option.textContent = `单独配置：${source.sheet || `链接 ${index + 1}`}`;
+    select.appendChild(option);
+  });
+  select.value = [...select.options].some((option) => option.value === selected) ? selected : "__default__";
+  currentMappingKey = select.value;
+}
+
+function collectTemplate(template) {
   const data = {};
-  for (const id of fields) data[id] = $(id).value.trim();
-  for (const id of checks) data[id] = $(id).checked;
-  data.sources = readSources();
-  data.source_urls = data.sources.map((s) => s.url);
-  data.fields = readFieldMaps();
-  data.align_sources = readAlignSources();
-  data.align_headers = $("align_headers").value;
+  (scalarFields[template] || []).forEach((id) => { if ($(id)) data[id] = $(id).value.trim(); });
+  (checkFields[template] || []).forEach((id) => { if ($(id)) data[id] = $(id).checked; });
+  if (template === "filter") { data.sources = readSources("sourceRows"); data.source_urls = data.sources.map((source) => source.url); data.fields = readFieldMaps(); }
+  if (template === "align") { saveCurrentMappingProfile(); data.align_sources = readSources("alignSourceRows"); data.align_mappings = defaultMappings; data.align_headers = defaultMappings.map((item) => item.target); data.align_mapping_profiles = mappingProfiles; }
+  if (template === "video") { data.vd_source_sheets = $("vd_source_sheets").value.split(/\r?\n|，|,/).map((x) => x.trim()).filter(Boolean); data.vd_types = $("vd_types").value.split(/\r?\n|，|,/).map((x) => x.trim()).filter(Boolean); data.vd_columns = readVdColumns(); }
   return data;
 }
 
-function fill(cfg) {
-  for (const id of fields) {
-    if (cfg[id] !== undefined && cfg[id] !== null && cfg[id] !== "") {
-      $(id).value = cfg[id];
-    }
+function fillTemplate(template, settings) {
+  (scalarFields[template] || []).forEach((id) => { if ($(id) && settings[id] !== undefined && settings[id] !== null) $(id).value = Array.isArray(settings[id]) ? settings[id].join("\n") : settings[id]; });
+  (checkFields[template] || []).forEach((id) => { if ($(id) && typeof settings[id] === "boolean") $(id).checked = settings[id]; });
+  if (template === "filter") { setSources("sourceRows", settings.sources || settings.source_urls || []); setFieldMaps(settings.fields || defaultFields); }
+  if (template === "align") {
+    setSources("alignSourceRows", settings.align_sources || []);
+    defaultMappings = settings.align_mappings || (settings.align_headers || []).map((name) => ({ target: name, source: name }));
+    mappingProfiles = settings.align_mapping_profiles || {};
+    currentMappingKey = "__default__";
+    refreshMappingProfileOptions();
+    setMappings(defaultMappings);
   }
-  for (const id of checks) {
-    if (typeof cfg[id] === "boolean") $(id).checked = cfg[id];
+  if (template === "video") {
+    if (Array.isArray(settings.vd_source_sheets)) $("vd_source_sheets").value = settings.vd_source_sheets.join("\n");
+    if (Array.isArray(settings.vd_types)) $("vd_types").value = settings.vd_types.join("\n");
+    setVdColumns(settings.vd_columns || []);
   }
-  if (Array.isArray(cfg.sources) && cfg.sources.length) {
-    setSources(cfg.sources);
-  } else {
-    setSources(cfg.source_urls || []);
-  }
-  setFieldMaps(cfg.fields || defaultFields);
-  setAlignSources(cfg.align_sources || []);
-  if (Array.isArray(cfg.align_headers)) {
-    $("align_headers").value = cfg.align_headers.join("\n");
-  }
-  updateAlignHeaderCount();
+  updateCounts();
 }
 
-function renderSchedule(s, infoId, btnId) {
-  const info = $(infoId || "schedInfo");
-  const btn = $(btnId || "schedBtn");
-  if (!s || !info || !btn) return;
-  if (!s.enabled) {
-    info.textContent = s.last_sync ? `定时未启动 · 上次同步 ${s.last_sync}` : "定时未启动";
-    btn.textContent = "保存并启动定时";
-    return;
-  }
-  info.textContent =
-    `已启动 · 每 ${s.minutes} 分钟` +
-    (s.next_run ? ` · 下次 ${s.next_run}` : "") +
-    (s.last_sync ? ` · 上次 ${s.last_sync}` : "");
-  btn.textContent = "停止定时";
+function fullPayload() {
+  const item = activeMenu();
+  if (item) item.settings = collectTemplate(item.template);
+  return { ...(item ? item.settings : {}), ui_menus: menus, ui_active_menu: activeId };
 }
 
-async function loadConfig() {
-  const res = await fetch("/api/config");
-  const data = await res.json();
-  defaultFields = data.default_fields || [];
-  fill(data.config || {});
-  renderSchedule(data.schedule);
-  renderSchedule(data.align_schedule, "alignSchedInfo", "alignSchedBtn");
-  const email = data.service_account_email || "未找到 credentials.json";
-  $("saEmail").textContent = email;
-  $("copySa").disabled = !data.service_account_email;
-}
-
-function setState(kind, text) {
-  const el = $("jobState");
-  el.className = "badge " + kind;
-  el.textContent = text;
-}
-
-function setRunDisabled(disabled) {
-  $("runBtn").disabled = disabled;
-  $("runAlignBtn").disabled = disabled;
-}
-
-function renderLogs(logs) {
-  $("log").textContent = (logs || [])
-    .map((l) => `[${l.t}] ${l.msg}`)
-    .join("\n");
-  $("log").scrollTop = $("log").scrollHeight;
-}
-
-async function saveConfig(silent) {
-  const res = await fetch("/api/save", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload()),
-  });
-  const data = await res.json();
-  if (!silent) {
-    setState(data.ok ? "ok" : "bad", data.ok ? "已保存" : "保存失败");
-  }
+async function saveConfig(silent = false) {
+  const response = await fetch("/api/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(fullPayload()) });
+  const data = await response.json();
+  if (!silent) setState(data.ok ? "ok" : "bad", data.ok ? "已保存" : "保存失败");
   return data.ok;
 }
 
-let timer = null;
-
-async function poll() {
-  const res = await fetch("/api/status");
-  const st = await res.json();
-  renderLogs(st.logs);
-  if (st.running) {
-    setState("run", "运行中");
-    setRunDisabled(true);
-    return;
-  }
-  setRunDisabled(false);
-  if (timer) {
-    clearInterval(timer);
-    timer = null;
-  }
-  if (st.error) {
-    setState("bad", "失败");
-    $("summary").hidden = false;
-    $("summary").textContent = st.error;
-    return;
-  }
-  if (st.schedule) renderSchedule(st.schedule);
-  if (st.align_schedule) renderSchedule(st.align_schedule, "alignSchedInfo", "alignSchedBtn");
-  if (st.skipped || (st.result && st.result.skipped)) {
-    setState("ok", "已跳过");
-    $("summary").hidden = false;
-    $("summary").textContent = "源表没有变化，本次未写入";
-    return;
-  }
-  if (st.result) {
-    const r = st.result;
-    setState(r.ok ? "ok" : "bad", r.ok ? "完成" : "部分失败");
-    const failed = (r.sources || []).filter((s) => s.error).length;
-    $("summary").hidden = false;
-    if (r.mode === "cloudflare") {
-      $("summary").textContent = r.skipped
-        ? `数据和上次相同，已跳过发布（${r.totalRows || 0} 条），不占 Cloudflare 配额`
-        : `已发布 Cloudflare ${r.totalRows || 0} 条` +
-          (r.publicManifestUrl ? ` · ${r.publicManifestUrl}` : "");
-    } else if (r.mode === "align") {
-      $("summary").textContent =
-        `对齐写入 ${r.total_rows} 行` + (failed ? ` · ${failed} 个源失败` : "");
-      if (r.target_url) {
-        $("openAlign").hidden = false;
-        $("openAlign").href = r.target_url;
-      }
-    } else {
-      $("summary").textContent =
-        `全部 ${r.total_rows} 行` +
-        (r.hot_rows != null ? ` · 高赞(≥${r.likes_threshold}) ${r.hot_rows} 行` : "") +
-        (failed ? ` · ${failed} 个源失败` : "");
-      if (r.target_url) {
-        $("openTarget").hidden = false;
-        $("openTarget").href = r.target_url;
-      }
-      if (r.hot_url) {
-        $("openHot").hidden = false;
-        $("openHot").href = r.hot_url;
-      }
-    }
-  } else {
-    setState("idle", "待命");
-  }
+function renderSchedule(schedule, infoId, buttonId) {
+  const info = $(infoId), button = $(buttonId);
+  if (!schedule || !info || !button) return;
+  if (!schedule.enabled) { info.textContent = schedule.last_sync ? `定时未启动 · 上次 ${schedule.last_sync}` : "定时未启动"; button.textContent = "保存并启动定时"; }
+  else { info.textContent = `已启动 · 每 ${schedule.minutes} 分钟${schedule.next_run ? ` · 下次 ${schedule.next_run}` : ""}`; button.textContent = "停止定时"; }
 }
 
-function beginJob(path) {
+async function loadConfig() {
+  const response = await fetch("/api/config");
+  const data = await response.json();
+  const cfg = data.config || {};
+  defaultFields = data.default_fields || [];
+  menus = Array.isArray(cfg.ui_menus) && cfg.ui_menus.length ? cfg.ui_menus : defaultMenusFromConfig(cfg);
+  activeId = menus.some((item) => item.id === cfg.ui_active_menu) ? cfg.ui_active_menu : menus[0].id;
+  $("saEmail").textContent = data.service_account_email || "未找到 credentials.json";
+  $("copySa").disabled = !data.service_account_email;
+  renderSchedule(data.schedule, "schedInfo", "schedBtn");
+  renderSchedule(data.align_schedule, "alignSchedInfo", "alignSchedBtn");
+  renderSchedule(data.video_schedule, "videoSchedInfo", "videoSchedBtn");
+  switchMenu(activeId);
+}
+
+function setRunDisabled(disabled) {
+  ["runBtn", "runCatalogBtn", "runAlignBtn", "runVideoBtn", "publishCfBtn"].forEach((id) => { if ($(id)) $(id).disabled = disabled; });
+}
+
+function renderLogs(logs) {
+  $("log").textContent = (logs || []).map((line) => `[${line.t}] ${line.msg}`).join("\n");
+  $("log").scrollTop = $("log").scrollHeight;
+}
+
+async function poll() {
+  const state = await (await fetch("/api/status")).json();
+  renderLogs(state.logs);
+  if (state.running) { setState("run", "运行中"); setRunDisabled(true); return; }
+  setRunDisabled(false);
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  if (state.error) { setState("bad", "失败"); showMessage(state.error); return; }
+  if (!state.result) return;
+  const result = state.result;
+  setState(result.ok ? "ok" : "bad", result.ok ? "完成" : "部分失败");
+  const failed = (result.sources || []).filter((item) => item.error).length;
+  if (result.mode === "catalog") { showMessage(`目录汇总写入 ${result.total_rows} 行${failed ? ` · ${failed} 项失败` : ""}`); if (result.target_url) { $("openCatalog").href = result.target_url; $("openCatalog").hidden = false; } }
+  else if (result.mode === "align") { showMessage(`字段映射写入 ${result.total_rows} 行${failed ? ` · ${failed} 个源失败` : ""}`); if (result.target_url) { $("openAlign").href = result.target_url; $("openAlign").hidden = false; } }
+  else if (result.mode === "video") { showMessage(`分类数据表已更新 · ${result.people || 0} 人 · 新提取 ${result.appended || 0} 条`); if (result.target_url) { $("openVideo").href = result.target_url; $("openVideo").hidden = false; } }
+  else if (result.mode === "cloudflare") showMessage(result.skipped ? "内容未变化，已跳过发布" : `图库已发布 ${result.totalRows || 0} 条`);
+  else { showMessage(`全部 ${result.total_rows || 0} 行${result.hot_rows != null ? ` · 高赞 ${result.hot_rows} 行` : ""}`); if (result.target_url) { $("openTarget").href = result.target_url; $("openTarget").hidden = false; } if (result.hot_url) { $("openHot").href = result.hot_url; $("openHot").hidden = false; } }
+}
+
+function beginJob() {
+  $("summary").hidden = true;
+  $("log").textContent = "";
   setState("run", "运行中");
   setRunDisabled(true);
-  if (timer) clearInterval(timer);
-  timer = setInterval(poll, 700);
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(poll, 800);
   poll();
 }
 
-async function startRun() {
-  $("summary").hidden = true;
-  $("openTarget").hidden = true;
-  $("openHot").hidden = true;
-  $("log").textContent = "";
-  if (!readSources().length) {
-    setState("bad", "缺数据源");
-    $("summary").hidden = false;
-    $("summary").textContent = "请填写至少一个源表链接";
-    return;
-  }
-  if (!$("write_all").checked && !$("write_hot").checked) {
-    setState("bad", "缺输出");
-    $("summary").hidden = false;
-    $("summary").textContent = "请至少勾选：全部结果，或高赞结果";
-    return;
-  }
-  if ($("write_all").checked && !$("target_url").value.trim()) {
-    setState("bad", "缺全部结果表");
-    $("summary").hidden = false;
-    $("summary").textContent = "请填写「全部结果」目标表链接";
-    $("target_url").focus();
-    return;
-  }
-  if ($("write_hot").checked && !$("hot_target_url").value.trim() && !$("target_url").value.trim()) {
-    setState("bad", "缺高赞表");
-    $("summary").hidden = false;
-    $("summary").textContent = "请填写高赞目标表链接（或与全部结果用同一张表）";
-    return;
-  }
-  if (!$("start_date").value || !$("end_date").value) {
-    setState("bad", "缺日期");
-    $("summary").hidden = false;
-    $("summary").textContent = "请填写开始和结束日期";
-    return;
-  }
-  if (!readFieldMaps().length) {
-    setState("bad", "缺字段");
-    $("summary").hidden = false;
-    $("summary").textContent = "抓取字段不能为空";
-    return;
-  }
-  const res = await fetch("/api/run", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload()),
-  });
-  const data = await res.json();
-  if (!data.ok) {
-    setState("bad", "无法开始");
-    $("summary").hidden = false;
-    $("summary").textContent = data.error || "未知错误";
-    return;
-  }
-  beginJob();
-}
-
-async function startAlign() {
-  $("summary").hidden = true;
-  $("openAlign").hidden = true;
-  $("log").textContent = "";
-  if (!readAlignSources().length) {
-    setState("bad", "缺数据源");
-    $("summary").hidden = false;
-    $("summary").textContent = "请填写至少一个源表链接";
-    return;
-  }
-  if (!$("align_target_url").value.trim()) {
-    setState("bad", "缺目标表");
-    $("summary").hidden = false;
-    $("summary").textContent = "请填写目标表链接";
-    return;
-  }
-  if (!$("align_headers").value.trim()) {
-    setState("bad", "缺表头");
-    $("summary").hidden = false;
-    $("summary").textContent = "请配置规范表头（一行一个）";
-    return;
-  }
-  const res = await fetch("/api/run-align", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload()),
-  });
-  const data = await res.json();
-  if (!data.ok) {
-    setState("bad", "无法开始");
-    $("summary").hidden = false;
-    $("summary").textContent = data.error || "未知错误";
-    return;
-  }
+async function startJob(path, validate) {
+  const payload = fullPayload();
+  const error = validate ? validate(payload) : "";
+  if (error) { showMessage(error, true); return; }
+  const response = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+  const data = await response.json();
+  if (!data.ok) { showMessage(data.error || "无法开始", true); return; }
   beginJob();
 }
 
 async function peekHeaders() {
-  const first = readAlignSources()[0];
-  if (!first) {
-    setState("bad", "缺数据源");
-    $("summary").hidden = false;
-    $("summary").textContent = "请先填写至少一个源表链接";
-    return;
-  }
-  $("peekHeaders").disabled = true;
-  try {
-    const res = await fetch("/api/peek-headers", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        ...payload(),
-        url: first.url,
-        sheet: first.sheet || $("align_source_sheet").value.trim(),
-        header_row: $("align_header_row").value,
-      }),
-    });
-    const data = await res.json();
-    if (!data.ok) {
-      setState("bad", "读取失败");
-      $("summary").hidden = false;
-      $("summary").textContent = data.error || "读表头失败";
-      return;
-    }
-    $("align_headers").value = (data.headers || []).join("\n");
-    updateAlignHeaderCount();
-    setState("ok", "已读表头");
-    $("summary").hidden = false;
-    $("summary").textContent = `从第一个源表读到 ${(data.headers || []).length} 个表头，可再增删调整`;
-  } finally {
-    $("peekHeaders").disabled = false;
-  }
+  saveCurrentMappingProfile();
+  const sources = readSources("alignSourceRows");
+  const source = currentMappingKey === "__default__" ? sources[0] : sources.find((item) => item.url === currentMappingKey);
+  if (!source) { showMessage("请先填写数据源链接", true); return; }
+  const response = await fetch("/api/peek-headers", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...fullPayload(), url: source.url, sheet: source.sheet || $("align_source_sheet").value.trim(), header_row: $("align_header_row").value }) });
+  const data = await response.json();
+  if (!data.ok) { showMessage(data.error || "读取表头失败", true); return; }
+  const mappings = (data.headers || []).map((name) => ({ target: name, source: name }));
+  setMappings(mappings);
+  saveCurrentMappingProfile();
+  setState("ok", "已读取表头");
 }
 
-document.querySelectorAll(".tab").forEach((btn) => {
-  btn.addEventListener("click", () => {
-    document.querySelectorAll(".tab").forEach((b) => b.classList.remove("on"));
-    btn.classList.add("on");
-    const name = btn.getAttribute("data-tab");
-    $("tab-filter").hidden = name !== "filter";
-    $("tab-align").hidden = name !== "align";
-  });
-});
-
-$("addSource").addEventListener("click", () => addSourceRow("", ""));
-$("clearSources").addEventListener("click", () => setSources([]));
-$("addAlignSource").addEventListener("click", () => addAlignSourceRow("", ""));
-$("clearAlignSources").addEventListener("click", () => setAlignSources([]));
-$("addField").addEventListener("click", () => addFieldRow({ sheet: "当月贴文库" }));
+$("addSource").addEventListener("click", () => addSourceRow("sourceRows"));
+$("clearSources").addEventListener("click", () => setSources("sourceRows", []));
+$("addAlignSource").addEventListener("click", () => { addSourceRow("alignSourceRows"); refreshMappingProfileOptions(); });
+$("clearAlignSources").addEventListener("click", () => { setSources("alignSourceRows", []); refreshMappingProfileOptions(); });
+$("addField").addEventListener("click", () => addFieldRow());
 $("resetFields").addEventListener("click", () => setFieldMaps(defaultFields));
-$("saveBtn").addEventListener("click", () => saveConfig(false));
-$("saveAlignBtn").addEventListener("click", () => saveConfig(false));
-$("runBtn").addEventListener("click", startRun);
-$("publishCfBtn").addEventListener("click", async () => {
-  $("summary").hidden = true;
-  $("log").textContent = "";
-  if (!$("cf_publish_url").value.trim() || !$("cf_publish_secret").value.trim()) {
-    setState("bad", "缺密钥");
-    $("summary").hidden = false;
-    $("summary").textContent = "请填写 Cloudflare 发布地址和 CACHE_PUBLISH_SECRET";
-    return;
-  }
-  const res = await fetch("/api/publish-cf", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload()),
-  });
-  const data = await res.json();
-  if (!data.ok) {
-    setState("bad", "无法开始");
-    $("summary").hidden = false;
-    $("summary").textContent = data.error || "发布失败";
-    return;
-  }
-  beginJob();
-});
-$("runAlignBtn").addEventListener("click", startAlign);
+$("addMapping").addEventListener("click", () => addMappingRow());
+$("addVdColumn").addEventListener("click", () => addVdColumnRow());
+$("mappingProfile").addEventListener("change", () => { saveCurrentMappingProfile(); currentMappingKey = $("mappingProfile").value; setMappings(currentMappingKey === "__default__" ? defaultMappings : (mappingProfiles[currentMappingKey] || defaultMappings)); });
 $("peekHeaders").addEventListener("click", peekHeaders);
-$("align_headers").addEventListener("input", updateAlignHeaderCount);
-$("schedBtn").addEventListener("click", async () => {
-  const enable = $("schedBtn").textContent.indexOf("停止") < 0;
-  $("schedule_enabled").checked = enable;
-  const res = await fetch("/api/schedule", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload()),
-  });
-  const data = await res.json();
-  if (!data.ok) {
-    setState("bad", "定时失败");
-    $("summary").hidden = false;
-    $("summary").textContent = data.error || "无法启动定时";
-    $("schedule_enabled").checked = false;
-    return;
-  }
-  renderSchedule(data.schedule);
-});
-$("alignSchedBtn").addEventListener("click", async () => {
-  const enable = $("alignSchedBtn").textContent.indexOf("停止") < 0;
-  $("align_schedule_enabled").checked = enable;
-  const res = await fetch("/api/align-schedule", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload()),
-  });
-  const data = await res.json();
-  if (!data.ok) {
-    setState("bad", "定时失败");
-    $("summary").hidden = false;
-    $("summary").textContent = data.error || "无法启动定时";
-    $("align_schedule_enabled").checked = false;
-    return;
-  }
-  renderSchedule(data.align_schedule, "alignSchedInfo", "alignSchedBtn");
-});
-$("copySa").addEventListener("click", async () => {
-  const t = $("saEmail").textContent;
-  try {
-    await navigator.clipboard.writeText(t);
-    $("copySa").textContent = "已复制";
-    setTimeout(() => ($("copySa").textContent = "复制"), 1200);
-  } catch (e) {
-    prompt("复制服务账号邮箱：", t);
-  }
-});
-$("moreBtn").addEventListener("click", () => {
-  const panel = $("morePanel");
-  panel.hidden = !panel.hidden;
-  $("moreBtn").textContent = panel.hidden ? "高级选项 ▾" : "高级选项 ▴";
-});
-$("fieldsBtn").addEventListener("click", () => {
-  const panel = $("fieldsPanel");
-  panel.hidden = !panel.hidden;
-  $("fieldsBtn").textContent = panel.hidden
-    ? "6. 抓取字段（默认按截图，可改） ▾"
-    : "6. 抓取字段（默认按截图，可改） ▴";
-});
+document.querySelectorAll(".save-template").forEach((button) => button.addEventListener("click", () => saveConfig(false)));
+$("runBtn").addEventListener("click", () => startJob("/api/run", (p) => !p.sources?.length ? "请至少填写一个源表链接" : (!p.start_date || !p.end_date ? "请填写开始和结束日期" : "")));
+$("runCatalogBtn").addEventListener("click", () => startJob("/api/run-catalog", (p) => !p.catalog_index_url ? "请填写目录表链接" : (!p.catalog_target_url ? "请填写目标表链接" : "")));
+$("runAlignBtn").addEventListener("click", () => startJob("/api/run-align", (p) => !p.align_sources?.length ? "请至少填写一个源表链接" : (!p.align_target_url ? "请填写目标表链接" : (!p.align_mappings?.length ? "请添加字段映射" : ""))));
+$("runVideoBtn").addEventListener("click", () => startJob("/api/run-video", (p) => !p.vd_source_url ? "请填写源表链接" : (!p.vd_dest_url ? "请填写目标表链接" : "")));
+$("publishCfBtn").addEventListener("click", () => startJob("/api/publish-cf", (p) => !p.cf_publish_url || !p.cf_publish_secret ? "请填写发布地址和密钥" : ""));
+
+$("schedBtn").addEventListener("click", async () => { const enable = !$("schedBtn").textContent.includes("停止"); $("schedule_enabled").checked = enable; const data = await (await fetch("/api/schedule", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(fullPayload()) })).json(); if (!data.ok) showMessage(data.error, true); else renderSchedule(data.schedule, "schedInfo", "schedBtn"); });
+$("alignSchedBtn").addEventListener("click", async () => { const enable = !$("alignSchedBtn").textContent.includes("停止"); $("align_schedule_enabled").checked = enable; const data = await (await fetch("/api/align-schedule", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(fullPayload()) })).json(); if (!data.ok) showMessage(data.error, true); else renderSchedule(data.align_schedule, "alignSchedInfo", "alignSchedBtn"); });
+$("videoSchedBtn").addEventListener("click", async () => { const enable = !$("videoSchedBtn").textContent.includes("停止"); $("vd_schedule_enabled").checked = enable; const data = await (await fetch("/api/video-schedule", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(fullPayload()) })).json(); if (!data.ok) { $("vd_schedule_enabled").checked = false; showMessage(data.error, true); } else renderSchedule(data.video_schedule, "videoSchedInfo", "videoSchedBtn"); });
+
+$("renameMenu").addEventListener("click", () => renameActive());
+$("deleteMenu").addEventListener("click", () => { if (menus.length <= 1) { showMessage("至少保留一个配置菜单", true); return; } const item = activeMenu(); if (!confirm(`删除配置“${item.name}”？`)) return; menus = menus.filter((entry) => entry.id !== activeId); activeId = menus[0].id; switchMenu(activeId); saveConfig(true); });
+$("addMenu").addEventListener("click", () => { $("newMenuName").value = ""; $("menuDialog").showModal(); });
+$("confirmAddMenu").addEventListener("click", (event) => { event.preventDefault(); const template = $("newMenuTemplate").value; const name = $("newMenuName").value.trim() || `${templateNames[template]}副本`; const base = menus.find((item) => item.template === template); const settings = base ? JSON.parse(JSON.stringify(base.settings || {})) : {}; const item = { id: newId(template), name, template, settings }; menus.push(item); $("menuDialog").close(); switchMenu(item.id); saveConfig(true); });
+$("copySa").addEventListener("click", async () => { try { await navigator.clipboard.writeText($("saEmail").textContent); $("copySa").textContent = "已复制"; setTimeout(() => $("copySa").textContent = "复制", 1000); } catch (_) { prompt("复制服务账号邮箱：", $("saEmail").textContent); } });
 
 loadConfig();
-setInterval(async () => {
-  try {
-    const res = await fetch("/api/status");
-    const st = await res.json();
-    if (st.schedule) renderSchedule(st.schedule);
-    if (st.align_schedule) renderSchedule(st.align_schedule, "alignSchedInfo", "alignSchedBtn");
-    if (st.running && !timer) {
-      timer = setInterval(poll, 700);
-      poll();
-    }
-  } catch (e) {}
-}, 4000);
+setInterval(async () => { try { const state = await (await fetch("/api/status")).json(); if (state.running && !pollTimer) { pollTimer = setInterval(poll, 800); poll(); } } catch (_) {} }, 4000);

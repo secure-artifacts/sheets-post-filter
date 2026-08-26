@@ -820,10 +820,161 @@ def _write_report_sheet(ws, out_start: int, include_headers: bool, range_label: 
     return len(names)
 
 
+def _custom_report_matrix(records, unit: int, configured_types: list[str], count_mode: str, preferred_names=None):
+    """自定义分类矩阵：第 1 行姓名、第 3 行类型、第 5 行汇总、第 8 行起日期。"""
+    usable = [
+        record
+        for record in records
+        if record.get("sec") is not None and str(record.get("name") or "").strip()
+    ]
+    discovered_names = {str(record.get("name") or "").strip() for record in usable}
+    names: list[str] = []
+    for name in preferred_names or []:
+        if name and name not in names:
+            names.append(name)
+    names.extend(sorted(discovered_names - set(names), key=str.casefold))
+    types = [_norm_type(value) for value in configured_types if _norm_type(value)]
+    if not types:
+        types = sorted({_norm_type(record.get("type")) or "未分类" for record in usable}, key=str.casefold)
+    if not types:
+        types = ["未分类"]
+
+    totals: dict[tuple[str, str], float] = defaultdict(float)
+    daily: dict[tuple[date, str, str], float] = defaultdict(float)
+    dates: set[date] = set()
+    for record in usable:
+        day = _as_date(record.get("date"))
+        if day is None:
+            continue
+        name = str(record.get("name") or "").strip()
+        typ = _norm_type(record.get("type")) or "未分类"
+        if typ not in types:
+            continue
+        seconds = float(record.get("sec") or 0)
+        value = float(_per_video_count(seconds)) if count_mode == "per_video_ceil" else seconds / float(unit)
+        totals[(name, typ)] += value
+        daily[(day, name, typ)] += value
+        dates.add(day)
+
+    width = 1 + len(names) * len(types)
+    row1 = [""]
+    row3 = ["类型"]
+    row5 = ["汇总"]
+    for name in names:
+        row1.extend([name] + [""] * (len(types) - 1))
+        row3.extend(types)
+        row5.extend([round(totals[(name, typ)], 2) for typ in types])
+    rows: list[list[Any]] = [
+        row1,
+        [""] * width,
+        row3,
+        [""] * width,
+        row5,
+        [""] * width,
+        [""] * width,
+    ]
+    for day in sorted(dates):
+        row: list[Any] = [day.isoformat()]
+        for name in names:
+            row.extend([round(daily[(day, name, typ)], 2) for typ in types])
+        rows.append(row)
+    return names, types, rows
+
+
+def _write_custom_report_sheet(ws, out_start: int, unit: int, records, log: LogFn, types, count_mode: str) -> int:
+    preferred_names: list[str] = []
+    try:
+        preferred_names = [str(value or "").strip() for value in ws.row_values(out_start) if str(value or "").strip()]
+    except Exception as exc:
+        log(f"读取现有姓名顺序失败：{exc}")
+    first_generation = not preferred_names
+    names, categories, payload = _custom_report_matrix(
+        records, unit, types or [], count_mode, preferred_names=preferred_names
+    )
+    width = max((len(row) for row in payload), default=1)
+    old_width = max(ws.col_count, width)
+    try:
+        ws.batch_clear([f"A{out_start}:{index_to_col_letter(old_width - 1)}{max(ws.row_count, out_start)}"])
+    except Exception:
+        pass
+    needed_rows = out_start - 1 + len(payload) + 10
+    if ws.row_count < needed_rows or ws.col_count < width:
+        ws.resize(rows=max(ws.row_count, needed_rows), cols=max(ws.col_count, width))
+    with_retry(
+        lambda: ws.update(range_name=f"A{out_start}", values=payload, value_input_option="USER_ENTERED"),
+        log=log,
+        what="写入自定义分类数据表",
+    )
+    if first_generation and names:
+        requests: list[dict[str, Any]] = []
+        block = len(categories)
+        for index, _name in enumerate(names):
+            start_col = 1 + index * block
+            if block > 1:
+                requests.append(
+                    {
+                        "mergeCells": {
+                            "range": {
+                                "sheetId": ws.id,
+                                "startRowIndex": out_start - 1,
+                                "endRowIndex": out_start,
+                                "startColumnIndex": start_col,
+                                "endColumnIndex": start_col + block,
+                            },
+                            "mergeType": "MERGE_ALL",
+                        }
+                    }
+                )
+        requests.extend(
+            [
+                {
+                    "updateDimensionProperties": {
+                        "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1},
+                        "properties": {"pixelSize": 82},
+                        "fields": "pixelSize",
+                    }
+                },
+                {
+                    "updateDimensionProperties": {
+                        "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 1, "endIndex": width},
+                        "properties": {"pixelSize": 64},
+                        "fields": "pixelSize",
+                    }
+                },
+            ]
+        )
+        data_start_index = out_start + 6
+        for col in range(1, width):
+            requests.append(
+                {
+                    "addConditionalFormatRule": {
+                        "rule": {
+                            "ranges": [{"sheetId": ws.id, "startRowIndex": data_start_index, "endRowIndex": data_start_index + max(1, len(payload) - 7), "startColumnIndex": col, "endColumnIndex": col + 1}],
+                            "gradientRule": {
+                                "minpoint": {"type": "MIN", "color": {"red": 0.95, "green": 0.99, "blue": 0.95}},
+                                "maxpoint": {"type": "MAX", "color": {"red": 0.18, "green": 0.68, "blue": 0.32}},
+                            },
+                        },
+                        "index": col - 1,
+                    }
+                }
+            )
+        if requests:
+            with_retry(lambda: ws.spreadsheet.batch_update({"requests": requests}), log=log, what="设置分类汇总样式")
+        log("自定义数据表首次生成：已设置姓名合并、紧凑列宽和绿色渐变")
+    else:
+        log("已保留现有姓名顺序和表格样式，仅更新数据")
+    log(f"已写入「{ws.title}」：{len(names)} 人，{len(categories)} 个分类，{max(0, len(payload) - 7)} 个日期")
+    return len(names)
+
+
 def run_video_duration(cfg, log: LogFn = print) -> dict[str, Any]:
     src_url = (getattr(cfg, "vd_source_url", "") or "").strip()
     dest_url = (getattr(cfg, "vd_dest_url", "") or "").strip()
     src_sheet = (getattr(cfg, "vd_source_sheet", "") or "").strip()
+    source_sheets = [str(x).strip() for x in (getattr(cfg, "vd_source_sheets", []) or []) if str(x).strip()]
+    if not source_sheets and src_sheet:
+        source_sheets = [x.strip() for x in src_sheet.replace("，", "\n").replace(",", "\n").splitlines() if x.strip()]
     if not src_url:
         raise RuntimeError("请填写视频时长源表链接")
     if not dest_url:
@@ -832,6 +983,38 @@ def run_video_duration(cfg, log: LogFn = print) -> dict[str, Any]:
     col_link = (getattr(cfg, "vd_col_link", "B") or "B").strip().upper()
     col_name = (getattr(cfg, "vd_col_name", "H") or "H").strip().upper()
     col_type = (getattr(cfg, "vd_col_type", "E") or "E").strip().upper()
+    configured_columns = [item for item in (getattr(cfg, "vd_columns", []) or []) if isinstance(item, dict)]
+    if configured_columns:
+        normalized_columns = [
+            {
+                "field": str(item.get("field") or item.get("role") or "分类").strip(),
+                "role": str(item.get("role") or "type").strip().lower(),
+                "column": str(item.get("column") or "").strip().upper(),
+            }
+            for item in configured_columns
+            if str(item.get("column") or "").strip()
+        ]
+        def _role_col(role: str, fallback: str) -> str:
+            return next((item["column"] for item in normalized_columns if item["role"] == role), fallback)
+        col_date = _role_col("date", col_date)
+        col_link = _role_col("link", col_link)
+        col_name = _role_col("name", col_name)
+        type_columns = [item for item in normalized_columns if item["role"] == "type"]
+        if type_columns:
+            col_type = type_columns[0]["column"]
+    else:
+        normalized_columns = [
+            {"field": "日期", "role": "date", "column": col_date},
+            {"field": "视频链接", "role": "link", "column": col_link},
+            {"field": "名字", "role": "name", "column": col_name},
+            {"field": "类型", "role": "type", "column": col_type},
+        ]
+        type_columns = [normalized_columns[-1]]
+    missing_roles = [role for role in ("date", "link", "name") if not any(item["role"] == role for item in normalized_columns)]
+    if missing_roles:
+        raise RuntimeError("源表列映射必须保留：日期、视频链接、名字")
+    if not type_columns:
+        raise RuntimeError("请至少保留一个类型/分类列映射")
     type_filters = _cfg_types(cfg)
     log_sheet = (getattr(cfg, "vd_log_sheet", "日志表") or "日志表").strip()
     report_sheet = (getattr(cfg, "vd_report_sheet", "数据表") or "数据表").strip()
@@ -843,70 +1026,86 @@ def run_video_duration(cfg, log: LogFn = print) -> dict[str, Any]:
     include_headers = bool(getattr(cfg, "vd_include_headers", True))
     out_start = max(1, int(getattr(cfg, "vd_out_start_row", 1) or 1))
     batch_size = max(20, min(500, int(getattr(cfg, "vd_batch_size", 100) or 100)))
-    start_d = _as_date(getattr(cfg, "vd_start_date", "") or "")
-    end_d = _as_date(getattr(cfg, "vd_end_date", "") or "")
-    if log_sheet == report_sheet:
+    date_filter_enabled = bool(getattr(cfg, "vd_date_filter_enabled", True))
+    start_d = _as_date(getattr(cfg, "vd_start_date", "") or "") if date_filter_enabled else None
+    end_d = _as_date(getattr(cfg, "vd_end_date", "") or "") if date_filter_enabled else None
+    type_filter_mode = str(getattr(cfg, "vd_type_filter_mode", "include") or "include").strip().lower()
+    if type_filter_mode not in ("include", "exclude", "all"):
+        type_filter_mode = "include"
+    write_log = bool(getattr(cfg, "vd_write_log", False))
+    if write_log and log_sheet == report_sheet:
         raise RuntimeError("日志表和数据表请用两个不同的工作表名称")
     try:
-        col_letter_to_index(col_date)
-        col_letter_to_index(col_link)
-        col_letter_to_index(col_name)
-        if type_filters:
-            col_letter_to_index(col_type)
+        for item in normalized_columns:
+            col_letter_to_index(item["column"])
     except ValueError:
         raise RuntimeError("日期/链接/制作人/类型列必须填字母，例如 A、B、H、E")
 
     gc = authorize(cfg.resolve_credentials())
     session = _session_from_gc(gc)
     src_ss = open_by_url_or_id(gc, src_url, log=log)
-    if src_sheet:
-        try:
-            ws = src_ss.worksheet(src_sheet)
-        except Exception as e:
-            raise RuntimeError(f"源表找不到工作表「{src_sheet}」") from e
-    else:
-        ws = src_ss.sheet1
-        src_sheet = ws.title
-    log(f"读取源表「{src_ss.title}」/「{src_sheet}」")
 
     def _pad_col(block) -> list:
         vals = [(row[0] if row else "") for row in (block or [])]
         return [""] * (start_row - 1) + vals
 
-    letters = [col_date, col_name]
-    if col_type:
-        letters.append(col_type)
-    ranges = [f"{L}{start_row}:{L}" for L in letters]
-    blocks = with_retry(lambda: ws.batch_get(ranges), log=log, what="读取源表列") or []
-    dates = _pad_col(blocks[0] if len(blocks) > 0 else [])
-    names = _pad_col(blocks[1] if len(blocks) > 1 else [])
-    types_col = _pad_col(blocks[2] if len(blocks) > 2 else [])
-    last = max(len(dates), len(names), len(types_col), start_row)
-    # B 列单元格显示的是文件名，真实 Drive 链接在超链接里
-    log(f"读取 {col_link} 列单元格超链接（不是文件名）…")
-    link_col = _read_link_column(session, src_ss.id, src_sheet, col_link, start_row, last, log=log)
-    n = last - start_row + 1
-    if n <= 0:
-        raise RuntimeError("源表没有数据行")
-    sample = next((u for u in link_col if u), "")
-    n_url = sum(1 for u in link_col if u)
-    log(f"共 {n} 行，其中 {n_url} 条取到超链接" + (f"，示例：{sample}" if sample else "。若为 0，说明单元格不是超链接"))
+    def _at(xs: list, row_1based: int) -> Any:
+        index = row_1based - 1
+        return xs[index] if 0 <= index < len(xs) else ""
+
+    selected_sheets = source_sheets or [src_ss.sheet1.title]
+    source_items: list[dict[str, Any]] = []
+    sample = ""
+    total_source_rows = 0
+    for selected_sheet in selected_sheets:
+        try:
+            ws = src_ss.worksheet(selected_sheet)
+        except Exception as e:
+            raise RuntimeError(f"源表找不到工作表「{selected_sheet}」") from e
+        log(f"读取源表「{src_ss.title}」/「{selected_sheet}」")
+        value_columns = [item for item in normalized_columns if item["role"] != "link"]
+        ranges = [f"{item['column']}{start_row}:{item['column']}" for item in value_columns]
+        blocks = with_retry(lambda ws=ws, ranges=ranges: ws.batch_get(ranges), log=log, what="读取源表列") or []
+        values_by_key: dict[tuple[str, str], list] = {}
+        for index, item in enumerate(value_columns):
+            values_by_key[(item["role"], item["column"])] = _pad_col(blocks[index] if index < len(blocks) else [])
+        last = max([len(values) for values in values_by_key.values()] + [start_row])
+        log(f"读取 {col_link} 列单元格超链接（不是文件名）…")
+        link_col = _read_link_column(session, src_ss.id, selected_sheet, col_link, start_row, last, log=log)
+        total_source_rows += max(0, last - start_row + 1)
+        if not sample:
+            sample = next((url for url in link_col if url), "")
+        for offset, url in enumerate(link_col):
+            row_num = start_row + offset
+            date_values = next((values for (role, _column), values in values_by_key.items() if role == "date"), [])
+            name_values = next((values for (role, _column), values in values_by_key.items() if role == "name"), [])
+            category_values = []
+            for item in type_columns:
+                value = str(_at(values_by_key.get(("type", item["column"]), []), row_num) or "").strip()
+                if value:
+                    category_values.append(value)
+            source_items.append(
+                {
+                    "url": url,
+                    "date": _at(date_values, row_num),
+                    "name": _at(name_values, row_num),
+                    "type": " / ".join(category_values),
+                }
+            )
+    n_url = sum(1 for item in source_items if item["url"])
+    log(f"共 {total_source_rows} 行，其中 {n_url} 条取到超链接" + (f"，示例：{sample}" if sample else "。若为 0，说明单元格不是超链接"))
     if n_url == 0:
         raise RuntimeError(
             f"{col_link} 列没有读到超链接。表格里看到的蓝字文件名本身不是网址，"
             "需要单元格插入的链接。请确认列字母填对，且服务账号对该表有权限。"
         )
 
-    def _at(xs: list, row_1based: int) -> Any:
-        i = row_1based - 1
-        return xs[i] if 0 <= i < len(xs) else ""
-
     dest = open_by_url_or_id(gc, dest_url, log=log)
     log_headers = ["日期", "视频链接", "名字", "时长(秒)", "类型"]
-    log_ws = _ensure_ws(dest, log_sheet, 8, 200, log)
+    log_ws = _ensure_ws(dest, log_sheet, 8, 200, log) if write_log else None
     report_ws = _ensure_ws(dest, report_sheet, 8, 200, log)
 
-    existing = _load_log_records(log_ws, log)
+    existing = _load_log_records(log_ws, log) if log_ws is not None else []
     index: dict[str, dict[str, Any]] = {}
     records: list[dict[str, Any]] = []
     for rec in existing:
@@ -915,7 +1114,7 @@ def run_video_duration(cfg, log: LogFn = print) -> dict[str, Any]:
             index[rec["key"]] = rec
     log(f"日志表已有 {len(existing)} 条")
 
-    if not existing:
+    if log_ws is not None and not existing:
         if include_headers:
             with_retry(
                 lambda: log_ws.update(range_name="A1", values=[log_headers], value_input_option="USER_ENTERED"),
@@ -925,8 +1124,10 @@ def run_video_duration(cfg, log: LogFn = print) -> dict[str, Any]:
             next_row = 2
         else:
             next_row = max(1, out_start)
-    else:
+    elif log_ws is not None:
         next_row = (2 if include_headers else 1) + len(existing)
+    else:
+        next_row = 1
     next_tracker = [next_row]
 
     pending: list[dict[str, Any]] = []
@@ -936,19 +1137,23 @@ def run_video_duration(cfg, log: LogFn = print) -> dict[str, Any]:
     out_of_range = 0
     type_skip = 0
     allowed_types = set(type_filters)
-    for i in range(n):
-        row_num = start_row + i
-        url = link_col[i] if i < len(link_col) else ""
+    for source_item in source_items:
+        url = source_item["url"]
         url = extract_url(url) or url
-        date_v = _at(dates, row_num)
+        date_v = source_item["date"]
         dt = to_datetime(date_v)
         date_s = dt.strftime("%Y-%m-%d") if dt else str(date_v or "").strip()
-        name = str(_at(names, row_num) or "").strip()
-        typ = _norm_type(_at(types_col, row_num))
+        name = str(source_item["name"] or "").strip()
+        typ = _norm_type(source_item["type"])
         if not url:
             empty_skip += 1
             continue
-        if allowed_types and typ not in allowed_types:
+        type_rejected = (
+            type_filter_mode == "include" and allowed_types and typ not in allowed_types
+        ) or (
+            type_filter_mode == "exclude" and allowed_types and typ in allowed_types
+        )
+        if type_rejected:
             type_skip += 1
             continue
         if not _in_date_range(date_s, start_d, end_d):
@@ -985,6 +1190,16 @@ def run_video_duration(cfg, log: LogFn = print) -> dict[str, Any]:
     appended = 0
 
     def _flush_report():
+        if not write_log:
+            return _write_custom_report_sheet(
+                report_ws,
+                out_start,
+                unit,
+                records,
+                log,
+                type_filters if type_filter_mode == "include" else [],
+                count_mode,
+            )
         people = _write_report_sheet(
             report_ws,
             out_start,
@@ -1041,7 +1256,8 @@ def run_video_duration(cfg, log: LogFn = print) -> dict[str, Any]:
                     item.get("type") or "",
                 ]
             )
-        _append_log_rows(log_ws, next_tracker, rows_out, log)
+        if log_ws is not None:
+            _append_log_rows(log_ws, next_tracker, rows_out, log)
         appended += len(rows_out)
         batch_i = bi // batch_size + 1
         people = 0
