@@ -48,7 +48,7 @@ npx wrangler pages deploy . --project-name=q-gallery-promo --commit-dirty=true -
 
 2. 在界面第 4 步填写 `CACHE_PUBLISH_SECRET`，点 **立即发布到 Cloudflare**，或勾选「汇总后自动发布」。
 
-站点：https://q-gallery-promo.pages.dev/  （promo.zhixianglife.com）
+站点：https://test.pages.dev/  （promo.test.com）
 
 ## 审核类型
 
