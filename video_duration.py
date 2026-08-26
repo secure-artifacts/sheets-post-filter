@@ -820,7 +820,7 @@ def _write_report_sheet(ws, out_start: int, include_headers: bool, range_label: 
     return len(names)
 
 
-def _custom_report_matrix(records, unit: int, configured_types: list[str], count_mode: str, preferred_names=None):
+def _custom_report_matrix(records, unit: int, configured_types: list[str], count_mode: str, preferred_names=None, value_mode: str = "count"):
     """自定义分类矩阵：第 1 行姓名、第 3 行类型、第 5 行汇总、第 8 行起日期。"""
     usable = [
         record
@@ -851,7 +851,9 @@ def _custom_report_matrix(records, unit: int, configured_types: list[str], count
         if typ not in types:
             continue
         seconds = float(record.get("sec") or 0)
-        value = float(_per_video_count(seconds)) if count_mode == "per_video_ceil" else seconds / float(unit)
+        value = 1.0 if value_mode == "count" else (
+            float(_per_video_count(seconds)) if count_mode == "per_video_ceil" else seconds / float(unit)
+        )
         totals[(name, typ)] += value
         daily[(day, name, typ)] += value
         dates.add(day)
@@ -889,7 +891,7 @@ def _write_custom_report_sheet(ws, out_start: int, unit: int, records, log: LogF
         log(f"读取现有姓名顺序失败：{exc}")
     first_generation = not preferred_names
     names, categories, payload = _custom_report_matrix(
-        records, unit, types or [], count_mode, preferred_names=preferred_names
+        records, unit, types or [], count_mode, preferred_names=preferred_names, value_mode="count"
     )
     width = max((len(row) for row in payload), default=1)
     old_width = max(ws.col_count, width)
@@ -1220,7 +1222,7 @@ def run_video_duration(cfg, log: LogFn = print) -> dict[str, Any]:
         log(f"没有新链接需要查询。已按筛选条件重写数据表，{people} 人")
         return {
             "ok": True,
-            "mode": "video",
+            "mode": "video" if write_log else "video_custom",
             "log_rows": len(records),
             "people": people,
             "ok_duration": 0,
@@ -1228,6 +1230,28 @@ def run_video_duration(cfg, log: LogFn = print) -> dict[str, Any]:
             "skipped": skipped,
             "target_url": dest_url,
             "log_sheet": log_sheet,
+            "report_sheet": report_sheet,
+        }
+
+    if not write_log:
+        # 自定义模板统计同一日期、人员和分类的记录条数，不查询视频时长，
+        # 也不创建日志表。原视频模板仍走下面的时长查询与日志追加流程。
+        for item in pending:
+            item["sec"] = 0
+            records.append(item)
+        people = _flush_report()
+        log(f"自定义分类汇总完成：统计 {len(records)} 条，数据表 {people} 人")
+        return {
+            "ok": True,
+            "mode": "video_custom",
+            "log_rows": 0,
+            "people": people,
+            "ok_duration": 0,
+            "miss_duration": 0,
+            "skipped": skipped,
+            "appended": len(pending),
+            "target_url": dest_url,
+            "log_sheet": "",
             "report_sheet": report_sheet,
         }
 

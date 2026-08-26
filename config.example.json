@@ -40,7 +40,7 @@
   "vd_schedule_minutes": 180,
   "vd_date_filter_enabled": true,
   "vd_type_filter_mode": "include",
-  "vd_write_log": false,
+  "vd_write_log": true,
   "vd_columns": [
     {"field": "日期", "role": "date", "column": "A"},
     {"field": "视频链接", "role": "link", "column": "B"},

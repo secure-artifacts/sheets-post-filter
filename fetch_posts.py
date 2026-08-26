@@ -15,11 +15,14 @@ import json
 import random
 import re
 import sys
+import threading
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, date, time as dt_time
 from pathlib import Path
 from typing import Any, Callable
+
+_CONFIG_WRITE_LOCK = threading.Lock()
 
 def resource_dir() -> Path:
     """PyInstaller 打包后的只读资源目录（网页界面）。"""
@@ -232,11 +235,11 @@ class Config:
     # 表头对齐支持“目标字段 <- 源字段”及按源链接覆盖。
     align_mappings: list[dict] = field(default_factory=list)
     align_mapping_profiles: dict[str, list[dict]] = field(default_factory=dict)
-    # 自定义视频分类汇总。
+    # 原“视频提取时长”保留日志表；自定义数据汇总模板会显式设为 False。
     vd_source_sheets: list[str] = field(default_factory=list)
     vd_date_filter_enabled: bool = True
     vd_type_filter_mode: str = "include"  # include | exclude | all
-    vd_write_log: bool = False
+    vd_write_log: bool = True
     vd_columns: list[dict] = field(
         default_factory=lambda: [
             {"field": "日期", "role": "date", "column": "A"},
@@ -290,10 +293,11 @@ def load_config(path: Path | None = None) -> Config:
 
 def save_config(cfg: Config, path: Path | None = None) -> Path:
     path = path or (SCRIPT_DIR / "config.json")
-    path.write_text(
-        json.dumps(config_to_dict(cfg), ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    with _CONFIG_WRITE_LOCK:
+        path.write_text(
+            json.dumps(config_to_dict(cfg), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
     return path
 
 

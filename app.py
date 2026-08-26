@@ -44,8 +44,8 @@ app = Flask(
     static_folder=str(RESOURCE_DIR / "web" / "static"),
 )
 
-_job_lock = threading.Lock()
-_job: dict = {
+def _new_job_state() -> dict:
+    return {
     "running": False,
     "logs": [],
     "result": None,
@@ -53,7 +53,14 @@ _job: dict = {
     "started_at": None,
     "finished_at": None,
     "skipped": False,
-}
+    }
+
+
+_job_lock = threading.Lock()
+_job: dict = _new_job_state()  # 兼容桌面端旧引用，对应 default 任务。
+_jobs: dict[str, dict] = {"default": _job}
+_job_locks: dict[str, threading.Lock] = {"default": _job_lock}
+_job_registry_lock = threading.Lock()
 
 _sched_lock = threading.Lock()
 _sched = {
@@ -81,27 +88,48 @@ _video_sched = {
 }
 
 
-def _reset_job() -> None:
-    _job["running"] = True
-    _job["logs"] = []
-    _job["result"] = None
-    _job["error"] = None
-    _job["skipped"] = False
-    _job["started_at"] = datetime.now().strftime("%H:%M:%S")
-    _job["finished_at"] = None
+def _job_key(cfg=None, explicit: str = "") -> str:
+    value = explicit or (getattr(cfg, "ui_active_menu", "") if cfg is not None else "") or "default"
+    return str(value).strip()[:160] or "default"
 
 
-def _log(msg: str) -> None:
+def _job_parts(key: str) -> tuple[dict, threading.Lock]:
+    key = _job_key(explicit=key)
+    with _job_registry_lock:
+        state = _jobs.setdefault(key, _new_job_state())
+        lock = _job_locks.setdefault(key, threading.Lock())
+    return state, lock
+
+
+def job_snapshot(key: str = "default") -> dict:
+    state, _lock = _job_parts(key)
+    return {**state, "logs": list(state.get("logs") or [])}
+
+
+def _reset_job(job: dict | None = None) -> None:
+    job = job or _job
+    job["running"] = True
+    job["logs"] = []
+    job["result"] = None
+    job["error"] = None
+    job["skipped"] = False
+    job["started_at"] = datetime.now().strftime("%H:%M:%S")
+    job["finished_at"] = None
+
+
+def _log(msg: str, job: dict | None = None) -> None:
+    job = job or _job
     line = {"t": datetime.now().strftime("%H:%M:%S"), "msg": str(msg)}
-    _job["logs"].append(line)
+    job["logs"].append(line)
     print(f"[{line['t']}] {msg}")
 
 
-def _record_job_failure(exc: Exception, context: str = "任务") -> None:
+def _record_job_failure(exc: Exception, context: str = "任务", job: dict | None = None) -> None:
     """Keep exception details local instead of returning them through the web API."""
     message = f"{context}失败，请查看本机运行日志"
-    _job["error"] = message
-    _log(message)
+    job = job or _job
+    job["error"] = message
+    _log(message, job)
     print(traceback.format_exc())
 
 
@@ -275,15 +303,17 @@ def _cfg_from_payload(data: dict) -> Config:
     return cfg
 
 
-def _run_job(cfg: Config, from_schedule: bool = False) -> None:
+def _run_job(cfg: Config, from_schedule: bool = False, job_key: str = "default") -> None:
+    job, lock = _job_parts(job_key)
+    job_log = lambda message: _log(message, job)
     try:
         if from_schedule and cfg.schedule_only_if_changed:
             cred = cfg.resolve_credentials()
             gc = authorize(cred)
             ids = [s.sid for s in normalize_sources(cfg.sources or cfg.source_urls)]
-            if ids and not sources_have_changed(gc, ids, log=_log):
-                _job["skipped"] = True
-                _job["result"] = {"ok": True, "skipped": True, "total_rows": 0, "hot_rows": 0}
+            if ids and not sources_have_changed(gc, ids, log=job_log):
+                job["skipped"] = True
+                job["result"] = {"ok": True, "skipped": True, "total_rows": 0, "hot_rows": 0}
                 return
         result = run(
             cfg,
@@ -293,15 +323,16 @@ def _run_job(cfg: Config, from_schedule: bool = False) -> None:
             config_url=cfg.config_url,
             start_date=to_datetime(cfg.start_date) if cfg.start_date else None,
             end_date=to_datetime(cfg.end_date) if cfg.end_date else None,
-            log=_log,
+            log=job_log,
         )
-        _job["result"] = result
+        job["result"] = result
     except Exception as e:
-        _record_job_failure(e, "筛选汇总")
+        _record_job_failure(e, "筛选汇总", job)
     finally:
-        _job["running"] = False
-        _job["finished_at"] = datetime.now().strftime("%H:%M:%S")
-        _job_lock.release()
+        job["running"] = False
+        job["finished_at"] = datetime.now().strftime("%H:%M:%S")
+        if lock.locked():
+            lock.release()
 
 
 def _schedule_state_key(kind: str) -> str:
@@ -360,7 +391,9 @@ def _try_fire(st: dict, kind: str) -> None:
         return
     if datetime.now() < nxt:
         return
-    if not _job_lock.acquire(blocking=False):
+    job_key = f"schedule:{kind}"
+    job, lock = _job_parts(job_key)
+    if not lock.acquire(blocking=False):
         with _sched_lock:
             st["last_msg"] = "到点时上一轮还在跑，1 分钟后重试"
             st["next_run"] = datetime.now() + timedelta(minutes=1)
@@ -368,30 +401,30 @@ def _try_fire(st: dict, kind: str) -> None:
     labels = {"filter": "筛选汇总", "align": "表头对齐", "video": "视频时长"}
     try:
         cfg = load_config()
-        _reset_job()
-        _log(f"{labels.get(kind, kind)}定时任务开始（间隔 {minutes} 分钟）")
+        _reset_job(job)
+        _log(f"{labels.get(kind, kind)}定时任务开始（间隔 {minutes} 分钟）", job)
         if kind == "align":
-            _run_align_job(cfg, from_schedule=True)
+            _run_align_job(cfg, from_schedule=True, job_key=job_key)
         elif kind == "video":
-            _run_video_job(cfg, from_schedule=True)
+            _run_video_job(cfg, from_schedule=True, job_key=job_key)
         else:
-            _run_job(cfg, from_schedule=True)
+            _run_job(cfg, from_schedule=True, job_key=job_key)
     except Exception as exc:
-        _record_job_failure(exc, f"{labels.get(kind, kind)}定时调度")
-        _job["running"] = False
-        _job["finished_at"] = datetime.now().strftime("%H:%M:%S")
-        if _job_lock.locked():
-            _job_lock.release()
+        _record_job_failure(exc, f"{labels.get(kind, kind)}定时调度", job)
+        job["running"] = False
+        job["finished_at"] = datetime.now().strftime("%H:%M:%S")
+        if lock.locked():
+            lock.release()
     finally:
         try:
             _remember_schedule_run(kind)
         except Exception as exc:
-            _log("保存定时状态失败，请查看本机运行日志")
+            _log("保存定时状态失败，请查看本机运行日志", job)
             print(traceback.format_exc())
         with _sched_lock:
             if st["enabled"]:
                 st["next_run"] = datetime.now() + timedelta(minutes=max(5, st["minutes"]))
-                st["last_msg"] = "已执行" if not _job.get("error") else "执行失败，下一轮会重试"
+                st["last_msg"] = "已执行" if not job.get("error") else "执行失败，下一轮会重试"
             else:
                 st["next_run"] = None
 
@@ -619,19 +652,23 @@ def api_config():
 
 
 def start_filter_job(cfg: Config, from_schedule: bool = False) -> str | None:
-    if not _job_lock.acquire(blocking=False):
-        return "正在运行中，请等当前任务结束"
+    job_key = _job_key(cfg)
+    job, lock = _job_parts(job_key)
+    if not lock.acquire(blocking=False):
+        return "这个配置正在运行中，请等它结束"
     save_config(cfg)
-    _reset_job()
-    threading.Thread(target=_run_job, args=(cfg, from_schedule), daemon=True).start()
+    _reset_job(job)
+    threading.Thread(target=_run_job, args=(cfg, from_schedule, job_key), daemon=True).start()
     return None
 
 
 def start_publish_job(cfg: Config) -> str | None:
-    if not _job_lock.acquire(blocking=False):
-        return "正在运行中，请等当前任务结束"
+    job_key = _job_key(cfg)
+    job, lock = _job_parts(job_key)
+    if not lock.acquire(blocking=False):
+        return "这个配置正在运行中，请等它结束"
     save_config(cfg)
-    _reset_job()
+    _reset_job(job)
 
     def _run_publish():
         try:
@@ -655,27 +692,28 @@ def start_publish_job(cfg: Config) -> str | None:
                 include_headers = bool(cfg.include_headers)
             if not url:
                 raise RuntimeError("请先填写要发布的目标表链接")
-            ss = open_by_url_or_id(gc, url, log=_log)
+            job_log = lambda message: _log(message, job)
+            ss = open_by_url_or_id(gc, url, log=job_log)
             ws = ss.worksheet(sheet)
-            values = read_sheet_values(ws, log=_log)
+            values = read_sheet_values(ws, log=job_log)
             headers, rows, how, data_start = split_sheet_for_publish(
                 values, start, include_headers
             )
-            _log(
+            job_log(
                 f"从「{ss.title}」/{sheet} 读取 {len(rows)} 行（{how}），开始发布 Cloudflare"
             )
-            overlay_formula_urls(ws, rows, data_start, log=_log)
+            overlay_formula_urls(ws, rows, data_start, log=job_log)
             result = publish_assets_to_cloudflare(
-                cfg, headers, rows, None, log=_log, start_row=data_start
+                cfg, headers, rows, None, log=job_log, start_row=data_start
             )
-            _job["result"] = {"ok": True, "mode": "cloudflare", **result}
+            job["result"] = {"ok": True, "mode": "cloudflare", **result}
         except Exception as e:
-            _record_job_failure(e, "发布")
+            _record_job_failure(e, "发布", job)
         finally:
-            _job["running"] = False
-            _job["finished_at"] = datetime.now().strftime("%H:%M:%S")
-            if _job_lock.locked():
-                _job_lock.release()
+            job["running"] = False
+            job["finished_at"] = datetime.now().strftime("%H:%M:%S")
+            if lock.locked():
+                lock.release()
 
     threading.Thread(target=_run_publish, daemon=True).start()
     return None
@@ -688,27 +726,30 @@ def start_align_job(cfg: Config, from_schedule: bool = False) -> str | None:
         return "请填写目标表链接"
     if not (cfg.align_mappings or cfg.align_headers):
         return "请配置字段映射"
-    if not _job_lock.acquire(blocking=False):
-        return "正在运行中，请等当前任务结束"
+    job_key = _job_key(cfg)
+    job, lock = _job_parts(job_key)
+    if not lock.acquire(blocking=False):
+        return "这个配置正在运行中，请等它结束"
     save_config(cfg)
-    _reset_job()
-    threading.Thread(target=_run_align_job, args=(cfg, from_schedule), daemon=True).start()
+    _reset_job(job)
+    threading.Thread(target=_run_align_job, args=(cfg, from_schedule, job_key), daemon=True).start()
     return None
 
 
-def _run_video_job(cfg: Config, from_schedule: bool = False) -> None:
+def _run_video_job(cfg: Config, from_schedule: bool = False, job_key: str = "default") -> None:
+    job, lock = _job_parts(job_key)
     try:
         from video_duration import run_video_duration
 
-        result = run_video_duration(cfg, log=_log)
-        _job["result"] = result
+        result = run_video_duration(cfg, log=lambda message: _log(message, job))
+        job["result"] = result
     except Exception as e:
-        _record_job_failure(e, "视频汇总")
+        _record_job_failure(e, "视频汇总", job)
     finally:
-        _job["running"] = False
-        _job["finished_at"] = datetime.now().strftime("%H:%M:%S")
-        if _job_lock.locked():
-            _job_lock.release()
+        job["running"] = False
+        job["finished_at"] = datetime.now().strftime("%H:%M:%S")
+        if lock.locked():
+            lock.release()
 
 
 def start_video_job(cfg: Config) -> str | None:
@@ -716,24 +757,27 @@ def start_video_job(cfg: Config) -> str | None:
         return "请填写视频时长源表链接"
     if not (getattr(cfg, "vd_dest_url", "") or "").strip():
         return "请填写写入目标表格链接"
-    if not _job_lock.acquire(blocking=False):
-        return "正在运行中，请等当前任务结束"
+    job_key = _job_key(cfg)
+    job, lock = _job_parts(job_key)
+    if not lock.acquire(blocking=False):
+        return "这个配置正在运行中，请等它结束"
     save_config(cfg)
-    _reset_job()
-    threading.Thread(target=_run_video_job, args=(cfg, False), daemon=True).start()
+    _reset_job(job)
+    threading.Thread(target=_run_video_job, args=(cfg, False, job_key), daemon=True).start()
     return None
 
 
-def _run_catalog_job(cfg: Config) -> None:
+def _run_catalog_job(cfg: Config, job_key: str = "default") -> None:
+    job, lock = _job_parts(job_key)
     try:
-        _job["result"] = run_catalog_merge(cfg, log=_log)
+        job["result"] = run_catalog_merge(cfg, log=lambda message: _log(message, job))
     except Exception as e:
-        _record_job_failure(e, "目录汇总")
+        _record_job_failure(e, "目录汇总", job)
     finally:
-        _job["running"] = False
-        _job["finished_at"] = datetime.now().strftime("%H:%M:%S")
-        if _job_lock.locked():
-            _job_lock.release()
+        job["running"] = False
+        job["finished_at"] = datetime.now().strftime("%H:%M:%S")
+        if lock.locked():
+            lock.release()
 
 
 def start_catalog_job(cfg: Config) -> str | None:
@@ -741,11 +785,13 @@ def start_catalog_job(cfg: Config) -> str | None:
         return "请填写目录表链接"
     if not cfg.catalog_target_url:
         return "请填写目标表链接"
-    if not _job_lock.acquire(blocking=False):
-        return "正在运行中，请等当前任务结束"
+    job_key = _job_key(cfg)
+    job, lock = _job_parts(job_key)
+    if not lock.acquire(blocking=False):
+        return "这个配置正在运行中，请等它结束"
     save_config(cfg)
-    _reset_job()
-    threading.Thread(target=_run_catalog_job, args=(cfg,), daemon=True).start()
+    _reset_job(job)
+    threading.Thread(target=_run_catalog_job, args=(cfg, job_key), daemon=True).start()
     return None
 
 
@@ -800,33 +846,33 @@ def api_run():
         return jsonify({"ok": False, "error": "请填写「全部结果」目标表链接"}), 400
     if cfg.write_hot and not (cfg.hot_target_url or cfg.target_url):
         return jsonify({"ok": False, "error": "请填写高赞目标表链接（可与全部结果同一张表）"}), 400
-    if not _job_lock.acquire(blocking=False):
-        return jsonify({"ok": False, "error": "正在运行中，请等当前任务结束"}), 409
-    save_config(cfg)
-    _reset_job()
-    t = threading.Thread(target=_run_job, args=(cfg, False), daemon=True)
-    t.start()
+    err = start_filter_job(cfg, from_schedule=False)
+    if err:
+        return jsonify({"ok": False, "error": err}), 409
     return jsonify({"ok": True})
 
 
-def _run_align_job(cfg: Config, from_schedule: bool = False) -> None:
+def _run_align_job(cfg: Config, from_schedule: bool = False, job_key: str = "default") -> None:
+    job, lock = _job_parts(job_key)
+    job_log = lambda message: _log(message, job)
     try:
         if from_schedule and cfg.align_schedule_only_if_changed:
             cred = cfg.resolve_credentials()
             gc = authorize(cred)
             ids = [s.sid for s in normalize_sources(cfg.align_sources)]
-            if ids and not sources_have_changed(gc, ids, log=_log):
-                _job["skipped"] = True
-                _job["result"] = {"ok": True, "skipped": True, "mode": "align", "total_rows": 0}
+            if ids and not sources_have_changed(gc, ids, log=job_log):
+                job["skipped"] = True
+                job["result"] = {"ok": True, "skipped": True, "mode": "align", "total_rows": 0}
                 return
-        result = run_align_sync(cfg, log=_log)
-        _job["result"] = result
+        result = run_align_sync(cfg, log=job_log)
+        job["result"] = result
     except Exception as e:
-        _record_job_failure(e, "字段映射")
+        _record_job_failure(e, "字段映射", job)
     finally:
-        _job["running"] = False
-        _job["finished_at"] = datetime.now().strftime("%H:%M:%S")
-        _job_lock.release()
+        job["running"] = False
+        job["finished_at"] = datetime.now().strftime("%H:%M:%S")
+        if lock.locked():
+            lock.release()
 
 
 @app.post("/api/run-align")
@@ -839,12 +885,9 @@ def api_run_align():
         return jsonify({"ok": False, "error": "请填写目标表链接"}), 400
     if not (cfg.align_mappings or cfg.align_headers):
         return jsonify({"ok": False, "error": "请配置字段映射"}), 400
-    if not _job_lock.acquire(blocking=False):
-        return jsonify({"ok": False, "error": "正在运行中，请等当前任务结束"}), 409
-    save_config(cfg)
-    _reset_job()
-    t = threading.Thread(target=_run_align_job, args=(cfg,), daemon=True)
-    t.start()
+    err = start_align_job(cfg)
+    if err:
+        return jsonify({"ok": False, "error": err}), 409
     return jsonify({"ok": True})
 
 
@@ -931,15 +974,16 @@ def api_video_schedule():
 
 @app.get("/api/status")
 def api_status():
+    job = job_snapshot(request.args.get("job_id", "default"))
     return jsonify(
         {
-            "running": _job["running"],
-            "logs": _job["logs"],
-            "result": _job["result"],
-            "error": _job["error"],
-            "skipped": _job.get("skipped"),
-            "started_at": _job["started_at"],
-            "finished_at": _job["finished_at"],
+            "running": job["running"],
+            "logs": job["logs"],
+            "result": job["result"],
+            "error": job["error"],
+            "skipped": job.get("skipped"),
+            "started_at": job["started_at"],
+            "finished_at": job["finished_at"],
             "schedule": _schedule_snapshot(),
             "align_schedule": _align_schedule_snapshot(),
             "video_schedule": _video_schedule_snapshot(),

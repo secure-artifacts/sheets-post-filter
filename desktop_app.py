@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""桌面工具：左侧配置菜单 + 右侧四套汇总模板。"""
+"""桌面工具：左侧配置菜单 + 右侧独立汇总模板。"""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ from fetch_posts import (
 from app import (
     _align_schedule_snapshot,
     _cfg_from_payload,
-    _job,
+    job_snapshot,
     _schedule_snapshot,
     _video_schedule_snapshot,
     start_align_job,
@@ -346,10 +346,9 @@ class DesktopApp(tk.Tk):
             "catalog": self.catalog_page,
             "align": self.align_page,
             "video": self.video_page,
+            "custom": self.video_page,
         }
-        for key, page in mapping.items():
-            if key == name:
-                page.lift()
+        mapping.get(name, self.filter_page).lift()
         for btn in (self.btn_run, self.btn_pub, self.btn_align, self.btn_video, self.btn_catalog, self.btn_save):
             btn.pack_forget()
         if name == "filter":
@@ -359,7 +358,8 @@ class DesktopApp(tk.Tk):
             self.btn_catalog.pack(side="left", padx=(0, 8))
         elif name == "align":
             self.btn_align.pack(side="left", padx=(0, 8))
-        elif name == "video":
+        elif name in ("video", "custom"):
+            self.btn_video.configure(text="提取视频时长" if name == "video" else "开始自定义汇总")
             self.btn_video.pack(side="left", padx=(0, 8))
         self.btn_save.pack(side="left")
 
@@ -368,17 +368,36 @@ class DesktopApp(tk.Tk):
             "filter": "贴文筛选汇总",
             "catalog": "目录表驱动汇总",
             "align": "字段映射 / 表头对齐",
-            "video": "自定义视频分类汇总",
+            "video": "视频提取时长",
+            "custom": "自定义数据汇总",
         }
         base = self._payload()
         stored = getattr(self.cfg, "ui_menus", None) or []
         if stored:
             self._menus = [copy.deepcopy(item) for item in stored if isinstance(item, dict) and item.get("template") in template_names]
+            migrated = False
+            for item in self._menus:
+                if item.get("template") == "video" and (
+                    (item.get("settings") or {}).get("vd_write_log") is False or "自定义" in str(item.get("name") or "")
+                ):
+                    item["template"] = "custom"
+                    item.setdefault("settings", {})["vd_write_log"] = False
+                    migrated = True
+            if migrated and not any(item.get("template") == "video" for item in self._menus):
+                video_settings = copy.deepcopy(base)
+                video_settings["vd_write_log"] = True
+                self._menus.insert(max(0, len(self._menus) - 1), {"id": "video-original-default", "name": template_names["video"], "template": "video", "settings": video_settings})
         if not self._menus:
-            self._menus = [
-                {"id": f"{key}-default", "name": label, "template": key, "settings": copy.deepcopy(base)}
-                for key, label in template_names.items()
-            ]
+            self._menus = []
+            for key, label in template_names.items():
+                settings = copy.deepcopy(base)
+                if key in ("video", "custom"):
+                    settings["vd_write_log"] = key == "video"
+                self._menus.append({"id": f"{key}-default", "name": label, "template": key, "settings": settings})
+        if not any(item.get("template") == "custom" for item in self._menus):
+            settings = copy.deepcopy(base)
+            settings["vd_write_log"] = False
+            self._menus.append({"id": "custom-default", "name": template_names["custom"], "template": "custom", "settings": settings})
         for item in self._menus:
             item.setdefault("id", f"{item['template']}-{id(item)}")
             item.setdefault("name", template_names[item["template"]])
@@ -393,7 +412,7 @@ class DesktopApp(tk.Tk):
             child.destroy()
         self._menu_buttons = {}
         for item in self._menus:
-            text = f"{item['name']}\n  { {'filter':'贴文模板','catalog':'目录模板','align':'映射模板','video':'分类模板'}[item['template']] }"
+            text = f"{item['name']}\n  { {'filter':'贴文模板','catalog':'目录模板','align':'映射模板','video':'时长模板','custom':'自定义模板'}[item['template']] }"
             btn = tk.Button(
                 self.menu_box,
                 text=text,
@@ -427,6 +446,10 @@ class DesktopApp(tk.Tk):
         settings = copy.deepcopy(item.get("settings") or {})
         self._load_cfg(_cfg_from_payload(settings))
         self._show_tab(item["template"])
+        self._log_n = 0
+        self.log.configure(state="normal")
+        self.log.delete("1.0", "end")
+        self.log.configure(state="disabled")
         self._render_menu_buttons()
         self.status.set(f"当前配置：{item['name']}")
 
@@ -443,18 +466,20 @@ class DesktopApp(tk.Tk):
     def _add_menu(self) -> None:
         choice = simpledialog.askstring(
             "新增配置菜单",
-            "选择模板：\n1 贴文筛选汇总\n2 目录表驱动汇总\n3 字段映射 / 表头对齐\n4 自定义视频分类汇总\n\n请输入 1-4：",
+            "选择模板：\n1 贴文筛选汇总\n2 目录表驱动汇总\n3 字段映射 / 表头对齐\n4 视频提取时长（保留日志）\n5 自定义数据汇总（不写日志）\n\n请输入 1-5：",
             parent=self,
         )
-        template = {"1": "filter", "2": "catalog", "3": "align", "4": "video"}.get((choice or "").strip())
+        template = {"1": "filter", "2": "catalog", "3": "align", "4": "video", "5": "custom"}.get((choice or "").strip())
         if not template:
             return
-        labels = {"filter": "贴文筛选汇总", "catalog": "目录表驱动汇总", "align": "字段映射 / 表头对齐", "video": "自定义视频分类汇总"}
+        labels = {"filter": "贴文筛选汇总", "catalog": "目录表驱动汇总", "align": "字段映射 / 表头对齐", "video": "视频提取时长", "custom": "自定义数据汇总"}
         name = simpledialog.askstring("新增配置菜单", "菜单名称：", initialvalue=f"{labels[template]}副本", parent=self)
         if not name or not name.strip():
             return
         source = next((item for item in self._menus if item["template"] == template), None)
         settings = copy.deepcopy(source.get("settings") if source else self._payload())
+        if template in ("video", "custom"):
+            settings["vd_write_log"] = template == "video"
         menu_id = f"{template}-{int(datetime.now().timestamp() * 1000)}"
         self._menus.append({"id": menu_id, "name": name.strip(), "template": template, "settings": settings})
         self._select_menu(menu_id)
@@ -975,10 +1000,10 @@ class DesktopApp(tk.Tk):
         self._add_vd_type()
         self._add_vd_type()
 
-        c3 = self._card(p, "5. 写入目标表", "只写数据表")
+        c3 = self._card(p, "5. 写入目标表", "视频模板写日志和数据；自定义模板只写数据")
         self._note(
             c3,
-            "第 1 行姓名（按分类合并），第 3 行类型，第 5 行汇总，第 8 行起是每日数据。刷新保留姓名顺序和用户样式。",
+            "视频提取时长保留日志表并支持断点续跑；自定义数据汇总不写日志，按日期和分类统计条数，并保留姓名顺序和用户样式。",
         )
         self.var_vd_dest_url = tk.StringVar()
         self._entry(c3, "写入表格链接", self.var_vd_dest_url)
@@ -987,15 +1012,16 @@ class DesktopApp(tk.Tk):
         self.var_vd_report_sheet = tk.StringVar(value="数据表")
         self.var_vd_out_start_row = tk.StringVar(value="1")
         self._cell(g, 0, "数据表名称", self.var_vd_report_sheet)
-        self._cell(g, 1, "写入起始行", self.var_vd_out_start_row)
+        self._cell(g, 1, "日志表名称（视频模板）", self.var_vd_log_sheet)
+        self._cell(g, 2, "写入起始行", self.var_vd_out_start_row)
         g2 = self._row3(c3)
         self.var_vd_unit = tk.StringVar(value="30")
         self.var_vd_count_mode = tk.StringVar(value="汇总总秒数 ÷ 30")
         self.var_vd_include_headers = tk.BooleanVar(value=True)
-        self._cell(g2, 0, "汇总除数（秒）", self.var_vd_unit)
+        self._cell(g2, 0, "汇总除数（仅视频模板）", self.var_vd_unit)
         mode_box = tk.Frame(g2, bg=C["card"])
         mode_box.grid(row=0, column=1, sticky="ew", padx=8)
-        tk.Label(mode_box, text="计数方式", bg=C["card"], fg=C["muted"], font=FS).pack(anchor="w")
+        tk.Label(mode_box, text="计数方式（仅视频模板）", bg=C["card"], fg=C["muted"], font=FS).pack(anchor="w")
         ttk.Combobox(
             mode_box,
             textvariable=self.var_vd_count_mode,
@@ -1237,7 +1263,7 @@ class DesktopApp(tk.Tk):
             "vd_source_sheets": [value.strip() for value in self.var_vd_source_sheet.get().replace("，", ",").split(",") if value.strip()],
             "vd_date_filter_enabled": self.var_vd_date_filter_enabled.get(),
             "vd_type_filter_mode": {"只包含这些类型": "include", "排除这些类型": "exclude", "不筛选类型": "all"}.get(self.var_vd_type_filter_mode.get(), "include"),
-            "vd_write_log": False,
+            "vd_write_log": next((item.get("template") != "custom" for item in self._menus if item.get("id") == self._active_menu_id), True),
             "vd_columns": self._read_vd_columns(),
             "sources": self._read_src("_src_rows"),
             "fields": self._read_fields(),
@@ -1464,7 +1490,8 @@ class DesktopApp(tk.Tk):
         self.log.configure(state="disabled")
 
     def _tick(self) -> None:
-        logs = _job.get("logs") or []
+        job = job_snapshot(self._active_menu_id or "default")
+        logs = job.get("logs") or []
         if len(logs) > self._log_n:
             self.log.configure(state="normal")
             for line in logs[self._log_n :]:
@@ -1472,7 +1499,7 @@ class DesktopApp(tk.Tk):
             self._log_n = len(logs)
             self.log.see("end")
             self.log.configure(state="disabled")
-        running = bool(_job.get("running"))
+        running = bool(job.get("running"))
         for b in (self.btn_run, self.btn_pub, self.btn_align, self.btn_video, self.btn_catalog):
             b.configure(state="disabled" if running else "normal")
         snap = _schedule_snapshot()
@@ -1482,8 +1509,8 @@ class DesktopApp(tk.Tk):
         if running:
             self.status.set("运行中…  " + (logs[-1]["msg"] if logs else ""))
             self._set_badge("运行中", C["accent"])
-        elif _job.get("error"):
-            self.status.set("失败：" + str(_job.get("error")))
+        elif job.get("error"):
+            self.status.set("失败：" + str(job.get("error")))
             self._set_badge("失败", C["bad"])
         else:
             self._set_badge("待命", "#3a463c")

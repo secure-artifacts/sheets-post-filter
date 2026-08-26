@@ -4,7 +4,8 @@ const templateNames = {
   filter: "贴文筛选汇总",
   catalog: "目录表驱动汇总",
   align: "字段映射 / 表头对齐",
-  video: "自定义视频分类汇总",
+  video: "视频提取时长",
+  custom: "自定义数据汇总",
 };
 
 const scalarFields = {
@@ -12,6 +13,7 @@ const scalarFields = {
   catalog: ["catalog_index_url", "catalog_index_sheet", "catalog_start_row", "catalog_url_col", "catalog_sheet_col", "catalog_target_url", "catalog_output_sheet", "catalog_output_start_row"],
   align: ["align_target_url", "align_output_sheet", "align_start_row", "align_source_sheet", "align_header_row", "align_schedule_minutes"],
   video: ["vd_source_url", "vd_source_sheets", "vd_start_row", "vd_col_date", "vd_col_link", "vd_col_name", "vd_col_type", "vd_types", "vd_start_date", "vd_end_date", "vd_type_filter_mode", "vd_dest_url", "vd_report_sheet", "vd_log_sheet", "vd_out_start_row", "vd_count_mode", "vd_unit_seconds", "vd_batch_size", "vd_schedule_minutes"],
+  custom: ["vd_source_url", "vd_source_sheets", "vd_start_row", "vd_col_date", "vd_col_link", "vd_col_name", "vd_col_type", "vd_types", "vd_start_date", "vd_end_date", "vd_type_filter_mode", "vd_dest_url", "vd_report_sheet", "vd_log_sheet", "vd_out_start_row", "vd_count_mode", "vd_unit_seconds", "vd_batch_size", "vd_schedule_minutes"],
 };
 
 const checkFields = {
@@ -19,6 +21,7 @@ const checkFields = {
   catalog: ["catalog_keep_each_header"],
   align: ["align_include_headers", "align_schedule_enabled", "align_schedule_only_if_changed"],
   video: ["vd_date_filter_enabled", "vd_write_log", "vd_include_headers", "vd_schedule_enabled"],
+  custom: ["vd_date_filter_enabled", "vd_write_log", "vd_include_headers", "vd_schedule_enabled"],
 };
 
 let defaultFields = [];
@@ -28,7 +31,6 @@ let renderedId = "";
 let currentMappingKey = "__default__";
 let defaultMappings = [];
 let mappingProfiles = {};
-let pollTimer = null;
 
 function newId(template) {
   return `${template}-${Date.now()}-${Math.random().toString(16).slice(2, 7)}`;
@@ -41,6 +43,31 @@ function defaultMenusFromConfig(cfg) {
     template,
     settings: collectInitialSettings(cfg, template),
   }));
+}
+
+function normalizeMenus(cfg) {
+  const stored = Array.isArray(cfg.ui_menus) ? JSON.parse(JSON.stringify(cfg.ui_menus)) : [];
+  if (!stored.length) return defaultMenusFromConfig(cfg);
+  let migratedCustom = false;
+  stored.forEach((item) => {
+    if (item.template === "video" && (item.settings?.vd_write_log === false || String(item.name || "").includes("自定义"))) {
+      item.template = "custom";
+      item.settings = { ...(item.settings || {}), vd_write_log: false };
+      migratedCustom = true;
+    }
+  });
+  if (migratedCustom && !stored.some((item) => item.template === "video")) {
+    stored.splice(Math.max(0, stored.length - 1), 0, {
+      id: "video-original-default",
+      name: templateNames.video,
+      template: "video",
+      settings: collectInitialSettings(cfg, "video"),
+    });
+  }
+  if (!stored.some((item) => item.template === "custom")) {
+    stored.push({ id: "custom-default", name: templateNames.custom, template: "custom", settings: collectInitialSettings(cfg, "custom") });
+  }
+  return stored.filter((item) => templateNames[item.template]);
 }
 
 function collectInitialSettings(cfg, template) {
@@ -57,7 +84,10 @@ function collectInitialSettings(cfg, template) {
     result.align_mappings = cfg.align_mappings || (cfg.align_headers || []).map((name) => ({ target: name, source: name }));
     result.align_mapping_profiles = cfg.align_mapping_profiles || {};
   }
-  if (template === "video") result.vd_columns = cfg.vd_columns || [];
+  if (template === "video" || template === "custom") {
+    result.vd_columns = cfg.vd_columns || [];
+    result.vd_write_log = template === "video";
+  }
   return result;
 }
 
@@ -96,12 +126,14 @@ function switchMenu(id) {
   activeId = id;
   const item = activeMenu();
   if (!item) return;
-  document.querySelectorAll(".template-panel").forEach((panel) => { panel.hidden = panel.id !== `panel-${item.template}`; });
+  const panelTemplate = item.template === "custom" ? "video" : item.template;
+  document.querySelectorAll(".template-panel").forEach((panel) => { panel.hidden = panel.id !== `panel-${panelTemplate}`; });
   $("workspaceTitle").textContent = item.name;
   $("templateLabel").textContent = templateNames[item.template] || "模板";
   fillTemplate(item.template, item.settings || {});
   renderedId = id;
   renderMenus();
+  poll();
 }
 
 function renameActive(id = activeId) {
@@ -248,7 +280,7 @@ function collectTemplate(template) {
   (checkFields[template] || []).forEach((id) => { if ($(id)) data[id] = $(id).checked; });
   if (template === "filter") { data.sources = readSources("sourceRows"); data.source_urls = data.sources.map((source) => source.url); data.fields = readFieldMaps(); }
   if (template === "align") { saveCurrentMappingProfile(); data.align_sources = readSources("alignSourceRows"); data.align_mappings = defaultMappings; data.align_headers = defaultMappings.map((item) => item.target); data.align_mapping_profiles = mappingProfiles; }
-  if (template === "video") { data.vd_source_sheets = $("vd_source_sheets").value.split(/\r?\n|，|,/).map((x) => x.trim()).filter(Boolean); data.vd_types = $("vd_types").value.split(/\r?\n|，|,/).map((x) => x.trim()).filter(Boolean); data.vd_columns = readVdColumns(); }
+  if (template === "video" || template === "custom") { data.vd_source_sheets = $("vd_source_sheets").value.split(/\r?\n|，|,/).map((x) => x.trim()).filter(Boolean); data.vd_types = $("vd_types").value.split(/\r?\n|，|,/).map((x) => x.trim()).filter(Boolean); data.vd_columns = readVdColumns(); data.vd_write_log = template === "video"; }
   return data;
 }
 
@@ -264,10 +296,19 @@ function fillTemplate(template, settings) {
     refreshMappingProfileOptions();
     setMappings(defaultMappings);
   }
-  if (template === "video") {
+  if (template === "video" || template === "custom") {
     if (Array.isArray(settings.vd_source_sheets)) $("vd_source_sheets").value = settings.vd_source_sheets.join("\n");
     if (Array.isArray(settings.vd_types)) $("vd_types").value = settings.vd_types.join("\n");
     setVdColumns(settings.vd_columns || []);
+    const custom = template === "custom";
+    $("vd_write_log").checked = !custom;
+    $("vdLogField").hidden = custom;
+    $("vdCountModeField").hidden = custom;
+    $("vdUnitField").hidden = custom;
+    $("vdOutputTitle").textContent = custom ? "4. 写入分类数据表" : "4. 写入日志表和数据表";
+    $("vdOutputNote").textContent = custom
+      ? "自定义数据汇总只写数据表：第 1 行姓名、第 3 行类型、第 5 行汇总、第 8 行起为每日数据；刷新保留姓名顺序和样式。"
+      : "视频提取时长会写入日志表和数据表；日志保存每条原视频的时长，已处理链接下次跳过并可断点续跑。";
   }
   updateCounts();
 }
@@ -297,7 +338,7 @@ async function loadConfig() {
   const data = await response.json();
   const cfg = data.config || {};
   defaultFields = data.default_fields || [];
-  menus = Array.isArray(cfg.ui_menus) && cfg.ui_menus.length ? cfg.ui_menus : defaultMenusFromConfig(cfg);
+  menus = normalizeMenus(cfg);
   activeId = menus.some((item) => item.id === cfg.ui_active_menu) ? cfg.ui_active_menu : menus[0].id;
   $("saEmail").textContent = data.service_account_email || "未找到 credentials.json";
   $("copySa").disabled = !data.service_account_email;
@@ -317,11 +358,11 @@ function renderLogs(logs) {
 }
 
 async function poll() {
-  const state = await (await fetch("/api/status")).json();
+  if (!activeId) return;
+  const state = await (await fetch(`/api/status?job_id=${encodeURIComponent(activeId)}`)).json();
   renderLogs(state.logs);
   if (state.running) { setState("run", "运行中"); setRunDisabled(true); return; }
   setRunDisabled(false);
-  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   if (state.error) { setState("bad", "失败"); showMessage(state.error); return; }
   if (!state.result) return;
   const result = state.result;
@@ -329,7 +370,7 @@ async function poll() {
   const failed = (result.sources || []).filter((item) => item.error).length;
   if (result.mode === "catalog") { showMessage(`目录汇总写入 ${result.total_rows} 行${failed ? ` · ${failed} 项失败` : ""}`); if (result.target_url) { $("openCatalog").href = result.target_url; $("openCatalog").hidden = false; } }
   else if (result.mode === "align") { showMessage(`字段映射写入 ${result.total_rows} 行${failed ? ` · ${failed} 个源失败` : ""}`); if (result.target_url) { $("openAlign").href = result.target_url; $("openAlign").hidden = false; } }
-  else if (result.mode === "video") { showMessage(`分类数据表已更新 · ${result.people || 0} 人 · 新提取 ${result.appended || 0} 条`); if (result.target_url) { $("openVideo").href = result.target_url; $("openVideo").hidden = false; } }
+  else if (result.mode === "video" || result.mode === "video_custom") { showMessage(`${result.mode === "video_custom" ? "分类条数" : "视频时长"}数据表已更新 · ${result.people || 0} 人 · 本次 ${result.appended || 0} 条`); if (result.target_url) { $("openVideo").href = result.target_url; $("openVideo").hidden = false; } }
   else if (result.mode === "cloudflare") showMessage(result.skipped ? "内容未变化，已跳过发布" : `图库已发布 ${result.totalRows || 0} 条`);
   else { showMessage(`全部 ${result.total_rows || 0} 行${result.hot_rows != null ? ` · 高赞 ${result.hot_rows} 行` : ""}`); if (result.target_url) { $("openTarget").href = result.target_url; $("openTarget").hidden = false; } if (result.hot_url) { $("openHot").href = result.hot_url; $("openHot").hidden = false; } }
 }
@@ -339,8 +380,6 @@ function beginJob() {
   $("log").textContent = "";
   setState("run", "运行中");
   setRunDisabled(true);
-  if (pollTimer) clearInterval(pollTimer);
-  pollTimer = setInterval(poll, 800);
   poll();
 }
 
@@ -396,4 +435,4 @@ $("confirmAddMenu").addEventListener("click", (event) => { event.preventDefault(
 $("copySa").addEventListener("click", async () => { try { await navigator.clipboard.writeText($("saEmail").textContent); $("copySa").textContent = "已复制"; setTimeout(() => $("copySa").textContent = "复制", 1000); } catch (_) { prompt("复制服务账号邮箱：", $("saEmail").textContent); } });
 
 loadConfig();
-setInterval(async () => { try { const state = await (await fetch("/api/status")).json(); if (state.running && !pollTimer) { pollTimer = setInterval(poll, 800); poll(); } } catch (_) {} }, 4000);
+setInterval(() => { poll().catch(() => {}); }, 800);

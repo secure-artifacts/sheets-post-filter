@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import difflib
+import re
+import unicodedata
 from typing import Any, Callable
 
 from fetch_posts import (
@@ -30,7 +33,30 @@ def _col_index(value: str) -> int:
 
 
 def _cell(row: list[Any], index: int) -> str:
-    return str(row[index] if index < len(row) else "").strip()
+    value = str(row[index] if index < len(row) else "")
+    return re.sub(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff]", "", value).strip()
+
+
+def _normalized_title(value: str) -> str:
+    value = unicodedata.normalize("NFKC", _cell([value], 0))
+    value = value.replace("\ufe0f", "").replace("\ufe0e", "")
+    return re.sub(r"\s+", "", value).casefold()
+
+
+def _pick_catalog_ws(spreadsheet, requested: str):
+    """Match titles robustly while never silently selecting an unrelated sheet."""
+    worksheets = spreadsheet.worksheets()
+    wanted = _normalized_title(requested)
+    matches = [ws for ws in worksheets if _normalized_title(ws.title) == wanted]
+    if len(matches) == 1:
+        return matches[0]
+    titles = [ws.title for ws in worksheets]
+    normalized = {_normalized_title(title): title for title in titles}
+    close_keys = difflib.get_close_matches(wanted, list(normalized), n=4, cutoff=0.45)
+    close_titles = [normalized[key] for key in close_keys]
+    shown = close_titles or titles[:8]
+    hint = "、".join(f"「{title}」" for title in shown) or "（没有工作表）"
+    raise RuntimeError(f"找不到工作表「{requested}」。该文件中的相近工作表：{hint}")
 
 
 def _write_matrix(ss, sheet_name: str, start_row: int, rows: list[list[Any]], log: LogFn) -> None:
@@ -92,37 +118,92 @@ def run_catalog_merge(cfg, log: LogFn = print) -> dict[str, Any]:
     index_ss = open_by_url_or_id(gc, index_url, log=log)
     index_ws = pick_source_ws(index_ss, getattr(cfg, "catalog_index_sheet", ""))
     index_rows = read_sheet_values(index_ws, log=log)
-    entries: list[tuple[str, str]] = []
-    for row in index_rows[start_row - 1 :]:
+    url_entries: list[tuple[int, str]] = []
+    sheet_entries: list[tuple[int, str]] = []
+    seen_urls: set[str] = set()
+    for row_number, row in enumerate(index_rows[start_row - 1 :], start_row):
         url = _cell(row, url_col)
         sheet_name = _cell(row, sheet_col)
-        if url and sheet_name:
-            entries.append((url, sheet_name))
-    if not entries:
-        raise RuntimeError("目录表中没有找到同时包含链接和工作表名称的数据行")
-    log(f"目录表读到 {len(entries)} 项，开始逐项汇总")
+        if url and url not in seen_urls:
+            seen_urls.add(url)
+            url_entries.append((row_number, url))
+        if sheet_name:
+            sheet_entries.append((row_number, sheet_name))
+    if not url_entries:
+        raise RuntimeError("目录表的链接列没有找到表格链接")
+    if not sheet_entries:
+        raise RuntimeError("目录表的工作表名称列没有找到名称")
+    log(f"目录表读到 {len(url_entries)} 个链接、{len(sheet_entries)} 个工作表名；将用每个名称遍历全部链接查找")
 
-    merged: list[list[Any]] = []
-    sources: list[dict[str, Any]] = []
-    header_written = False
-    for number, (url, sheet_name) in enumerate(entries, 1):
-        item = {"url": url, "sheet": sheet_name, "rows": 0, "error": None}
+    opened: list[tuple[int, Any, list[Any]]] = []
+    open_errors: list[dict[str, Any]] = []
+    for number, (row_number, url) in enumerate(url_entries, 1):
         try:
             source_ss = open_by_url_or_id(gc, url, log=log)
-            source_ws = pick_source_ws(source_ss, sheet_name)
-            values = read_sheet_values(source_ws, log=log)
-            if values and header_written and not keep_each_header:
-                values = values[1:]
-            if values:
-                header_written = True
-            merged.extend(values)
-            item["title"] = source_ss.title
-            item["rows"] = len(values)
-            log(f"[{number}/{len(entries)}] 「{source_ss.title}」/「{sheet_name}」：{len(values)} 行")
+            worksheets = source_ss.worksheets()
+            opened.append((row_number, source_ss, worksheets))
+            log(f"[链接 {number}/{len(url_entries)}] 目录第 {row_number} 行「{source_ss.title}」：{len(worksheets)} 个工作表")
         except Exception as exc:
-            item["error"] = str(exc)
-            log(f"[{number}/{len(entries)}] 「{sheet_name}」失败，已跳过：{exc}")
-        sources.append(item)
+            detail = str(exc).strip()
+            if isinstance(exc, PermissionError) or not detail:
+                detail = "服务账号没有访问权限；请把这个 B 列表格共享给当前服务账号"
+            open_errors.append({"row": row_number, "url": url, "sheet": "", "rows": 0, "error": detail})
+            log(f"[链接 {number}/{len(url_entries)}] 目录第 {row_number} 行链接无法打开，已跳过：{detail}")
+    if not opened:
+        raise RuntimeError("目录中的所有表格链接都无法打开")
+
+    merged: list[list[Any]] = []
+    sources: list[dict[str, Any]] = list(open_errors)
+    header_written = False
+    requested: dict[str, tuple[int, str]] = {}
+    for row_number, sheet_name in sheet_entries:
+        requested.setdefault(_normalized_title(sheet_name), (row_number, sheet_name))
+    found_names: set[str] = set()
+    match_number = 0
+    for source_row, source_ss, worksheets in opened:
+        by_title = {_normalized_title(ws.title): ws for ws in worksheets}
+        for wanted, (name_row, sheet_name) in requested.items():
+            source_ws = by_title.get(wanted)
+            if source_ws is None:
+                continue
+            found_names.add(wanted)
+            match_number += 1
+            item = {
+                "row": name_row,
+                "source_row": source_row,
+                "url": spreadsheet_url(source_ss.id),
+                "sheet": sheet_name,
+                "title": source_ss.title,
+                "rows": 0,
+                "error": None,
+            }
+            try:
+                values = read_sheet_values(source_ws, log=log)
+                if values and header_written and not keep_each_header:
+                    values = values[1:]
+                if values:
+                    header_written = True
+                merged.extend(values)
+                item["rows"] = len(values)
+                log(f"[匹配 {match_number}] B 列文件「{source_ss.title}」→ D 列「{source_ws.title}」：{len(values)} 行")
+            except Exception as exc:
+                item["error"] = str(exc)
+                log(f"[匹配 {match_number}] 「{source_ss.title}」/「{source_ws.title}」读取失败，已跳过：{exc}")
+            sources.append(item)
+
+    for wanted, (row_number, sheet_name) in requested.items():
+        if wanted in found_names:
+            continue
+        candidates: list[tuple[float, str, str]] = []
+        for _source_row, source_ss, worksheets in opened:
+            for ws in worksheets:
+                score = difflib.SequenceMatcher(None, wanted, _normalized_title(ws.title)).ratio()
+                candidates.append((score, source_ss.title, ws.title))
+        candidates.sort(reverse=True)
+        hints = "、".join(f"「{book}/{title}」" for _score, book, title in candidates[:3]) or "（没有工作表）"
+        error = f"遍历 {len(opened)} 个可访问表格后仍找不到；相近项：{hints}"
+        sources.append({"row": row_number, "url": "", "sheet": sheet_name, "rows": 0, "error": error})
+        log(f"D 列第 {row_number} 行「{sheet_name}」未匹配，已跳过：{error}")
 
     if not merged:
         raise RuntimeError("所有目录项均读取失败，没有可写入的数据")
