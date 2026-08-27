@@ -117,6 +117,80 @@ def _date_key(value: Any) -> str:
     return day.isoformat() if day else ""
 
 
+def _earliest_iso_date(old: str, new: str) -> str:
+    """Same video on more than one source day: keep the earliest calendar date."""
+    old_s = str(old or "").strip()
+    new_s = str(new or "").strip()
+    if not new_s:
+        return old_s
+    if not old_s:
+        return new_s
+    return min(old_s, new_s)
+
+
+def _apply_earlier_source(
+    rec: dict[str, Any], date_s: str, name: str = "", typ: str = ""
+) -> dict[str, Any]:
+    """Move a log/pending row to this source day only when it is earlier than the date already kept."""
+    changed: dict[str, Any] = {}
+    old_date = rec.get("date") or ""
+    chosen = _earliest_iso_date(old_date, date_s)
+    if not date_s or chosen != date_s or date_s == old_date:
+        return changed
+    rec["date"] = date_s
+    changed["date"] = date_s
+    if name and name != (rec.get("name") or ""):
+        rec["name"] = name
+        changed["name"] = name
+    if typ and typ != (rec.get("type") or ""):
+        rec["type"] = typ
+        changed["type"] = typ
+    return changed
+
+
+def _ingest_video_source_row(
+    *,
+    key: str,
+    date_s: str,
+    name: str,
+    typ: str,
+    url: str,
+    seen_src: dict[str, dict[str, Any]],
+    index: dict[str, dict[str, Any]],
+    pending: list[dict[str, Any]],
+    log_patches: list[dict[str, Any]],
+) -> str:
+    """Deduplicate by Drive/YouTube id. Same file on multiple days keeps the earliest date.
+
+    Returns pending | dup_earlier | dup_later | log_skip | log_earlier | empty_key.
+    """
+    if not key:
+        return "empty_key"
+    tracked = seen_src.get(key)
+    if tracked is not None:
+        changed = _apply_earlier_source(tracked, date_s, name, typ)
+        if changed.get("date"):
+            row = tracked.get("row")
+            if row:
+                log_patches.append({**changed, "row": row})
+            return "dup_earlier"
+        return "dup_later"
+    prev = index.get(key)
+    if prev is not None and prev.get("sec") is not None:
+        seen_src[key] = prev
+        changed = _apply_earlier_source(prev, date_s, name, typ)
+        if changed:
+            row = prev.get("row")
+            if row:
+                log_patches.append({**changed, "row": row})
+            return "log_earlier" if changed.get("date") else "log_skip"
+        return "log_skip"
+    item = {"date": date_s, "url": url, "name": name, "sec": None, "key": key, "type": typ}
+    pending.append(item)
+    seen_src[key] = item
+    return "pending"
+
+
 def _norm_name(value: Any) -> str:
     text = unicodedata.normalize("NFKC", str(value or ""))
     return " ".join(text.split())
@@ -722,7 +796,7 @@ def _patch_log_fields(ws, patches: list[dict[str, Any]], log: LogFn) -> None:
             log=log,
             what="更正日志日期",
         )
-    log(f"已按源表更正日志 {len(patches)} 条日期（纯文本写入，避免 2026-8-23 被表格挪到第二天）")
+    log(f"已按源表更正日志 {len(patches)} 条（日期取最早一天，纯文本写入，避免时区把 23 号写成 24 号）")
 
 
 def _qty_total(seconds: float, unit: int):
@@ -1773,11 +1847,13 @@ def run_video_duration(cfg, log: LogFn = print, cancelled=None) -> dict[str, Any
     next_tracker = [next_row]
 
     pending: list[dict[str, Any]] = []
-    seen_src: set[str] = set()
+    seen_src: dict[str, dict[str, Any]] = {}
     skipped = 0
     empty_skip = 0
     out_of_range = 0
     type_skip = 0
+    dup_earlier = 0
+    dup_later = 0
     log_patches: list[dict[str, Any]] = []
     for source_item in source_items:
         url = extract_url(source_item["url"]) or source_item["url"]
@@ -1816,28 +1892,23 @@ def run_video_duration(cfg, log: LogFn = print, cancelled=None) -> dict[str, Any
             for bucket in buckets:
                 pending.append({"date": date_s, "url": url, "name": name, "sec": 0, "key": "", "type": bucket})
             continue
-        key = link_key(url)
-        if not key or key in seen_src:
-            continue
-        seen_src.add(key)
-        prev = index.get(key)
-        if prev is not None and prev.get("sec") is not None:
-            changed: dict[str, Any] = {}
-            if date_s and date_s != (prev.get("date") or ""):
-                prev["date"] = date_s
-                changed["date"] = date_s
-            if typ and typ != (prev.get("type") or ""):
-                prev["type"] = typ
-                changed["type"] = typ
-            if name and name != (prev.get("name") or ""):
-                prev["name"] = name
-                changed["name"] = name
-            if changed and prev.get("row"):
-                changed["row"] = prev["row"]
-                log_patches.append(changed)
+        action = _ingest_video_source_row(
+            key=link_key(url),
+            date_s=date_s,
+            name=name,
+            typ=typ,
+            url=url,
+            seen_src=seen_src,
+            index=index,
+            pending=pending,
+            log_patches=log_patches,
+        )
+        if action in ("log_skip", "log_earlier"):
             skipped += 1
-            continue
-        pending.append({"date": date_s, "url": url, "name": name, "sec": None, "key": key, "type": typ})
+        if action in ("dup_earlier", "log_earlier"):
+            dup_earlier += 1
+        elif action == "dup_later":
+            dup_later += 1
 
     range_label = "全部日期"
     if start_d or end_d:
@@ -1849,6 +1920,11 @@ def run_video_duration(cfg, log: LogFn = print, cancelled=None) -> dict[str, Any
             f"{range_label}：待查询 {len(pending)}，已有时长跳过 {skipped}，"
             f"空链接 {empty_skip}，类型不符 {type_skip}，日期外 {out_of_range}"
         )
+        if dup_earlier or dup_later:
+            log(
+                f"同一链接在源表出现多个日期，已按最早一天计：更正 {dup_earlier} 条，"
+                f"忽略较晚重复 {dup_later} 条"
+            )
         if log_ws is not None and log_patches:
             _patch_log_fields(log_ws, log_patches, log)
     else:

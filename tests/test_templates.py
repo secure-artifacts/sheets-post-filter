@@ -21,9 +21,12 @@ from roster_fill import (  # noqa: E402
     sort_dates_desc,
 )
 from video_duration import (  # noqa: E402
+    _apply_earlier_source,
     _custom_buckets,
     _custom_report_matrix,
     _date_key,
+    _earliest_iso_date,
+    _ingest_video_source_row,
     _merge_video_payload,
     _per_video_count,
     _report_matrix,
@@ -378,6 +381,91 @@ class VideoReportTests(unittest.TestCase):
         self.assertIn("2026-09-01", dates)
         august = next(row for row in merged[4:] if row[0] == "2026-08-01")
         self.assertEqual(august[1], 5)
+
+    def test_duplicate_drive_keeps_earliest_source_date(self):
+        self.assertEqual(_earliest_iso_date("2026-08-24", "2026-08-23"), "2026-08-23")
+        self.assertEqual(_earliest_iso_date("2026-08-23", "2026-08-24"), "2026-08-23")
+        rec = {"date": "2026-08-24", "name": "甜甜", "type": "形式化口播"}
+        changed = _apply_earlier_source(rec, "2026-08-23", "甜甜", "形式化口播")
+        self.assertEqual(changed["date"], "2026-08-23")
+        self.assertEqual(rec["date"], "2026-08-23")
+        self.assertEqual(_apply_earlier_source(rec, "2026-08-24"), {})
+        self.assertEqual(rec["date"], "2026-08-23")
+
+        def _run(rows, index=None):
+            seen, pending, patches = {}, [], []
+            idx = dict(index or {})
+            actions = [
+                _ingest_video_source_row(
+                    key=key,
+                    date_s=date_s,
+                    name=name,
+                    typ=typ,
+                    url=f"https://drive.google.com/file/d/{key[2:]}/view",
+                    seen_src=seen,
+                    index=idx,
+                    pending=pending,
+                    log_patches=patches,
+                )
+                for key, date_s, name, typ in rows
+            ]
+            return actions, pending, patches, idx
+
+        # Source lists 8/24 first (upper rows) then 8/23: keep 8/23, one pending.
+        actions, pending, patches, _idx = _run(
+            [
+                ("d:abc", "2026-08-24", "甜甜", "形式化口播"),
+                ("d:abc", "2026-08-23", "甜甜", "形式化口播"),
+            ]
+        )
+        self.assertEqual(actions, ["pending", "dup_earlier"])
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["date"], "2026-08-23")
+        self.assertEqual(patches, [])
+
+        # Already logged as 8/24: later 8/23 must patch the log, not overwrite 23→24.
+        logged = {
+            "d:abc": {
+                "date": "2026-08-24",
+                "name": "甜甜",
+                "type": "形式化口播",
+                "sec": 8,
+                "row": 100,
+                "key": "d:abc",
+            }
+        }
+        actions, pending, patches, idx = _run(
+            [
+                ("d:abc", "2026-08-24", "甜甜", "形式化口播"),
+                ("d:abc", "2026-08-23", "甜甜", "形式化口播"),
+            ],
+            index=logged,
+        )
+        self.assertEqual(actions, ["log_skip", "dup_earlier"])
+        self.assertEqual(pending, [])
+        self.assertEqual(patches[0]["date"], "2026-08-23")
+        self.assertEqual(idx["d:abc"]["date"], "2026-08-23")
+
+        actions, pending, patches, idx = _run(
+            [
+                ("d:abc", "2026-08-24", "甜甜", "形式化口播"),
+                ("d:abc", "2026-08-23", "甜甜", "形式化口播"),
+            ],
+            index={
+                "d:abc": {
+                    "date": "2026-08-23",
+                    "name": "甜甜",
+                    "type": "形式化口播",
+                    "sec": 8,
+                    "row": 100,
+                    "key": "d:abc",
+                }
+            },
+        )
+        self.assertEqual(actions, ["log_skip", "dup_later"])
+        self.assertEqual(pending, [])
+        self.assertEqual(patches, [])
+        self.assertEqual(idx["d:abc"]["date"], "2026-08-23")
 
     def test_per_video_step_count(self):
         values = [30, 34.9, 35, 60, 70, 89, 90, 120]
