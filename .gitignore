@@ -9,6 +9,8 @@ env/
 config.json
 sync_state.json
 credentials.json
+credentials-*.json
+logs/
 *.log
 .DS_Store
 Thumbs.db

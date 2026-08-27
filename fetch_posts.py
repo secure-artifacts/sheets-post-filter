@@ -17,6 +17,7 @@ import re
 import sys
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, date, time as dt_time
 from pathlib import Path
@@ -41,6 +42,19 @@ def data_dir() -> Path:
 SCRIPT_DIR = data_dir()
 RESOURCE_DIR = resource_dir()
 STATE_FILE = SCRIPT_DIR / "sync_state.json"
+LOG_DIR = SCRIPT_DIR / "logs"
+
+
+def write_app_log(message: str, extra: str = "") -> Path:
+    """Append a line to today's log file for later troubleshooting."""
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    path = LOG_DIR / f"app-{datetime.now().strftime('%Y-%m-%d')}.log"
+    line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {message}"
+    if extra:
+        line += "\n" + extra.rstrip() + "\n"
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
+    return path
 SHEETS_EPOCH = datetime(1899, 12, 30)
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -84,17 +98,130 @@ def is_quota_error(err: Exception) -> bool:
     return "429" in text or "quota" in text or "rate limit" in text
 
 
+MAX_WORKBOOK_CELLS = 10_000_000
+CELL_SAFETY = 200_000
+
+
+def used_column_count(rows: list[list[Any]]) -> int:
+    width = 0
+    for row in rows or []:
+        last = len(row)
+        while last > 0 and str(row[last - 1] if last - 1 < len(row) else "").strip() == "":
+            last -= 1
+        if last > width:
+            width = last
+    return width
+
+
+def drop_empty_rows(rows: list[list[Any]]) -> list[list[Any]]:
+    """Skip completely blank rows."""
+    out: list[list[Any]] = []
+    for row in rows or []:
+        if any(str(cell).strip() for cell in row):
+            out.append(list(row))
+    return out
+
+
+def trim_trailing_empty_columns(rows: list[list[Any]]) -> list[list[Any]]:
+    """Drop empty trailing columns so a 1000-column grid does not explode the 10M cell cap."""
+    width = used_column_count(rows)
+    if width <= 0:
+        return []
+    out: list[list[Any]] = []
+    for row in rows:
+        clipped = list(row[:width])
+        if len(clipped) < width:
+            clipped.extend([""] * (width - len(clipped)))
+        out.append(clipped)
+    return out
+
+
+def compact_sheet_rows(rows: list[list[Any]]) -> list[list[Any]]:
+    """Keep only rows/columns that actually have values; width follows the last used column."""
+    return drop_empty_rows(trim_trailing_empty_columns(rows))
+
+
+def workbook_cell_count(ss) -> int:
+    total = 0
+    for ws in ss.worksheets():
+        total += max(1, int(getattr(ws, "row_count", 0) or 0)) * max(1, int(getattr(ws, "col_count", 0) or 0))
+    return total
+
+
+def safe_resize_ws(ws, rows: int, cols: int, log: LogFn = print) -> None:
+    """Fit a sheet to rows×cols without crossing Google's 10 million cell workbook limit.
+
+    Extra blank columns on an old target sheet are the usual cause of
+    `This action would increase the number of cells... 10000000`.
+    Shrink first, then grow to the exact needed size.
+    """
+    rows = max(1, int(rows))
+    cols = max(1, int(cols))
+    current_rows = max(1, int(getattr(ws, "row_count", 1) or 1))
+    current_cols = max(1, int(getattr(ws, "col_count", 1) or 1))
+    if current_rows == rows and current_cols == cols:
+        return
+
+    def _resize(next_rows: int, next_cols: int, what: str) -> None:
+        with_retry(lambda r=next_rows, c=next_cols: ws.resize(rows=r, cols=c), log=log, what=what)
+
+    # Free unused cells before any growth.
+    if current_cols > cols or current_rows > rows:
+        _resize(min(current_rows, max(rows, 1)), min(current_cols, max(cols, 1)), "缩小空白行列")
+        current_rows = max(1, int(getattr(ws, "row_count", 1) or 1))
+        current_cols = max(1, int(getattr(ws, "col_count", 1) or 1))
+
+    if current_rows >= rows and current_cols >= cols:
+        if current_rows != rows or current_cols != cols:
+            _resize(rows, cols, "调整工作表大小")
+        return
+
+    ss = getattr(ws, "spreadsheet", None)
+    other = 0
+    if ss is not None:
+        try:
+            other = workbook_cell_count(ss) - current_rows * current_cols
+        except Exception:
+            other = 0
+    room = MAX_WORKBOOK_CELLS - CELL_SAFETY - max(0, other)
+    needed = rows * cols
+    if needed > room:
+        raise RuntimeError(
+            f"目标表将超过 Google 表格 1000 万单元格上限（需要 {rows}×{cols}={needed}，"
+            f"工作簿里其他工作表大约已占 {max(0, other)} 格）。"
+            "请换一个空表格当目标，或删掉目标文件里不用的工作表和空白列后再汇总。"
+        )
+    try:
+        _resize(rows, cols, "扩大工作表")
+    except Exception as exc:
+        text = str(exc)
+        if "10000000" in text or "number of cells" in text.lower():
+            raise RuntimeError(
+                "目标表单元格超过 Google 1000 万上限。请换空表格，或先删掉目标文件里过大的工作表。"
+            ) from exc
+        raise
+
+
 def with_retry(fn, log: LogFn = print, what: str = "请求", tries: int = RETRY_TIMES):
     last: Exception | None = None
+    pool = current_credential_pool()
     n = max(tries, 8)
+    if pool is not None and len(pool.paths) > 1:
+        n = max(n, len(pool.paths) * 4)
     for i in range(n):
         try:
-            return fn()
+            result = fn()
+            if pool is not None:
+                pool.note_success()
+            return result
         except Exception as e:
             last = e
             quota = is_quota_error(e)
             if (not is_transient_error(e) and not quota) or i >= n - 1:
                 raise
+            if quota and pool is not None and pool.rotate(f"{what}额度用完"):
+                log(f"  {what}已换账号，立即重试（{i + 1}/{n}）…")
+                continue
             if quota:
                 wait = min(120.0, 65.0 + i * 10.0) + random.random() * 8
                 log(f"  {what}额度用完，{wait:.0f} 秒后重试（{i + 1}/{n}）…")
@@ -139,6 +266,7 @@ def copy_default_fields() -> list[dict]:
 @dataclass
 class Config:
     credentials_file: str = ""
+    credentials_files: list[str] = field(default_factory=list)
     # 含「数据库」sheet 的表格（可选，一般不用）
     config_url: str = ""
     # 汇总写入的目标表
@@ -232,6 +360,27 @@ class Config:
     catalog_output_sheet: str = "目录汇总"
     catalog_output_start_row: int = 1
     catalog_keep_each_header: bool = False
+    catalog_schedule_enabled: bool = False
+    catalog_schedule_minutes: int = 180
+    # 队别专页 / 引流对照：配置表字段映射后，按队别分 sheet 写入。
+    roster_config_url: str = ""
+    roster_config_sheet: str = ""
+    roster_start_row: int = 2
+    roster_target_url: str = ""
+    roster_traffic_sheet: str = "引流"
+    roster_date_start_row: int = 24
+    roster_columns: list[dict] = field(
+        default_factory=lambda: [
+            {"field": "队别", "role": "team", "column": "A"},
+            {"field": "类型", "role": "type", "column": "B"},
+            {"field": "名字", "role": "name", "column": "C"},
+            {"field": "专页名字", "role": "page_name", "column": "G"},
+            {"field": "专页编码", "role": "page_code", "column": "H"},
+            {"field": "专页链接", "role": "page_link", "column": "I"},
+            {"field": "chat", "role": "chat", "column": "K"},
+            {"field": "数据表格", "role": "data_url", "column": "R"},
+        ]
+    )
     # 表头对齐支持“目标字段 <- 源字段”及按源链接覆盖。
     align_mappings: list[dict] = field(default_factory=list)
     align_mapping_profiles: dict[str, list[dict]] = field(default_factory=dict)
@@ -240,6 +389,14 @@ class Config:
     vd_date_filter_enabled: bool = True
     vd_type_filter_mode: str = "include"  # include | exclude | all
     vd_write_log: bool = True
+    vd_other_category: str = ""
+    vd_exclude_types: list[str] = field(default_factory=list)
+    # columns_plus_other: 单独成列 + 其余（含未分类）
+    # other_only: 列出的分类不统计，其余含未分类全部归入
+    vd_category_mode: str = "columns_plus_other"
+    vd_empty_to_other: bool = True
+    # 只影响数据表多出来的分类列，不影响第 4 节的筛选分类。
+    vd_report_categories: list[str] = field(default_factory=list)
     vd_columns: list[dict] = field(
         default_factory=lambda: [
             {"field": "日期", "role": "date", "column": "A"},
@@ -447,6 +604,13 @@ _SHEETS_SERIAL_MAX = 100000.0
 _JS_SAFE_INT = 2**53
 
 
+def _parse_ymd(year: int, month: int, day: int, hour: int = 0, minute: int = 0, second: int = 0) -> datetime | None:
+    try:
+        return datetime(year, month, day, hour, minute, second)
+    except ValueError:
+        return None
+
+
 def to_datetime(value: Any) -> datetime | None:
     if value is None or value == "":
         return None
@@ -464,11 +628,46 @@ def to_datetime(value: Any) -> datetime | None:
             except (OverflowError, ValueError, OSError):
                 return None
         return None
-    text = str(value).strip()
+    text = unicodedata.normalize("NFKC", str(value)).strip()
+    text = text.replace("\u00a0", " ").replace("\u3000", " ")
     if not text:
         return None
+    if re.fullmatch(r"\d{4,5}(?:\.\d+)?", text):
+        try:
+            n = float(text)
+        except ValueError:
+            n = -1
+        if _SHEETS_SERIAL_MIN <= n <= _SHEETS_SERIAL_MAX:
+            try:
+                return SHEETS_EPOCH + timedelta(days=n)
+            except (OverflowError, ValueError, OSError):
+                pass
     text = text.replace("年", "-").replace("月", "-").replace("日", "")
     text = text.replace(".", "-").replace("/", "-")
+    text = re.sub(r"\s+", " ", text).strip(" -")
+    time_part = r"(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?"
+    m = re.match(rf"^(\d{{4}})-(\d{{1,2}})-(\d{{1,2}}){time_part}", text)
+    if m:
+        return _parse_ymd(
+            int(m.group(1)),
+            int(m.group(2)),
+            int(m.group(3)),
+            int(m.group(4) or 0),
+            int(m.group(5) or 0),
+            int(m.group(6) or 0),
+        )
+    # 表格读回来经常是 8/23/2026、23/8/2026，转成 8-23-2026 后再拆。
+    m = re.match(rf"^(\d{{1,2}})-(\d{{1,2}})-(\d{{4}}){time_part}", text)
+    if m:
+        first, second, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        hour, minute, second_n = int(m.group(4) or 0), int(m.group(5) or 0), int(m.group(6) or 0)
+        if first > 12:
+            day, month = first, second
+        elif second > 12:
+            month, day = first, second
+        else:
+            month, day = first, second
+        return _parse_ymd(year, month, day, hour, minute, second_n)
     for fmt in (
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%d %H:%M",
@@ -721,6 +920,126 @@ def authorize(cred_path: Path):
 
     creds = Credentials.from_service_account_file(str(cred_path), scopes=SCOPES)
     return gspread.authorize(creds)
+
+
+_pool_local = threading.local()
+
+
+def current_credential_pool():
+    return getattr(_pool_local, "pool", None)
+
+
+def collect_credential_paths(cfg) -> list[Path]:
+    """All configured service-account JSON files that exist on disk, first file first."""
+    seen: set[str] = set()
+    out: list[Path] = []
+    raw: list[str] = []
+    if getattr(cfg, "credentials_file", ""):
+        raw.append(str(cfg.credentials_file).strip())
+    for item in getattr(cfg, "credentials_files", None) or []:
+        raw.append(str(item or "").strip())
+    for text in raw:
+        if not text:
+            continue
+        path = Path(text)
+        if not path.is_absolute():
+            path = SCRIPT_DIR / path
+        try:
+            key = str(path.resolve()) if path.exists() else str(path)
+        except Exception:
+            key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        if path.exists():
+            out.append(path)
+    if out:
+        return out
+    return [cfg.resolve_credentials()]
+
+
+class CredentialPool:
+    """Round-robin multiple service accounts; swap immediately on 429 instead of waiting a minute."""
+
+    def __init__(self, paths: list[Path], log: LogFn = print):
+        self.paths = [Path(p) for p in paths]
+        if not self.paths:
+            raise FileNotFoundError("没有可用的服务账号 JSON")
+        self.log = log
+        self.index = 0
+        self.gc = None
+        self._hits = 0
+        self._cooldown: dict[int, float] = {}
+
+    def email(self, index: int | None = None) -> str:
+        path = self.paths[self.index if index is None else index]
+        return service_account_email(path) or path.name
+
+    def _load_creds(self, path: Path):
+        from google.oauth2.service_account import Credentials
+
+        return Credentials.from_service_account_file(str(path), scopes=SCOPES)
+
+    def _bind(self, gc, creds) -> None:
+        gc.auth = creds
+        hc = getattr(gc, "http_client", None)
+        session = getattr(hc, "session", None) if hc is not None else None
+        if session is not None and hasattr(session, "credentials"):
+            session.credentials = creds
+            return
+        try:
+            import google.auth.transport.requests as transport
+
+            new_session = transport.AuthorizedSession(creds)
+            if hc is not None:
+                hc.session = new_session
+                if hasattr(hc, "auth"):
+                    hc.auth = creds
+        except Exception:
+            pass
+
+    def activate(self):
+        self.gc = authorize(self.paths[self.index])
+        self._bind(self.gc, self._load_creds(self.paths[self.index]))
+        _pool_local.pool = self
+        extra = f"，共 {len(self.paths)} 个账号轮询" if len(self.paths) > 1 else ""
+        self.log(f"服务账号: {self.email()}{extra}")
+        return self.gc
+
+    def rotate(self, reason: str = "额度用完") -> bool:
+        if len(self.paths) < 2:
+            return False
+        self._cooldown[self.index] = time.time() + 55
+        old = self.email()
+        now = time.time()
+        for step in range(1, len(self.paths) + 1):
+            nxt = (self.index + step) % len(self.paths)
+            if now < self._cooldown.get(nxt, 0) and step < len(self.paths):
+                continue
+            try:
+                creds = self._load_creds(self.paths[nxt])
+            except Exception as exc:
+                self.log(f"服务账号 {self.paths[nxt].name} 无法加载：{exc}")
+                continue
+            self.index = nxt
+            if self.gc is not None:
+                self._bind(self.gc, creds)
+            self._hits = 0
+            self.log(f"{reason}，已切换服务账号 {old} → {self.email()}")
+            return True
+        return False
+
+    def note_success(self) -> None:
+        if len(self.paths) < 2:
+            return
+        self._hits += 1
+        if self._hits >= 45:
+            self.rotate("分散请求以免单账号额度用尽")
+
+
+def authorize_cfg(cfg, log: LogFn = print):
+    """Authorize using the credential pool so quota errors can rotate accounts."""
+    return CredentialPool(collect_credential_paths(cfg), log=log).activate()
 
 
 def load_sync_state() -> dict[str, Any]:
@@ -1357,17 +1676,13 @@ def run(
     csv_path: Path | None = None,
     log: LogFn = print,
 ) -> dict[str, Any]:
-    cred_path = cfg.resolve_credentials()
-    email = service_account_email(cred_path)
-    log(f"服务账号: {email or cred_path}")
+    gc = authorize_cfg(cfg, log=log)
 
     target_ref = target_url or cfg.target_url or cfg.spreadsheet_id
     source_refs = normalize_sources(
         sources if sources is not None else (cfg.sources or source_urls or cfg.source_urls)
     )
     field_maps = resolve_fields(cfg)
-
-    gc = authorize(cred_path)
 
     if not source_refs:
         raise RuntimeError("请至少填写一个数据源表格链接（所有源表表头相同，只换链接）")
@@ -1605,8 +1920,7 @@ def peek_source_headers(
     sheet_name: str = "",
     header_row: int = 1,
 ) -> list[str]:
-    cred_path = cfg.resolve_credentials()
-    gc = authorize(cred_path)
+    gc = authorize_cfg(cfg)
     ss = open_by_url_or_id(gc, source_url)
     ws = pick_source_ws(ss, sheet_name or cfg.align_source_sheet)
     row_n = max(1, int(header_row or cfg.align_header_row or 1))
@@ -1616,8 +1930,7 @@ def peek_source_headers(
 
 def run_align_sync(cfg: Config, log: LogFn = print) -> dict[str, Any]:
     """按字段映射对齐拷贝；每个源链接可覆盖默认映射。"""
-    cred_path = cfg.resolve_credentials()
-    log(f"服务账号: {service_account_email(cred_path) or cred_path}")
+    gc = authorize_cfg(cfg, log=log)
     default_mappings: list[dict[str, str]] = []
     for item in getattr(cfg, "align_mappings", []) or []:
         if not isinstance(item, dict):
@@ -1642,7 +1955,6 @@ def run_align_sync(cfg: Config, log: LogFn = print) -> dict[str, Any]:
     if not target_ref:
         raise RuntimeError("请填写目标表链接")
 
-    gc = authorize(cred_path)
     header_row_n = max(1, int(cfg.align_header_row or 1))
     log(f"字段映射 {len(headers)} 列: " + "、".join(headers))
     log(f"源表 {len(source_refs)} 个 · 表头在第 {header_row_n} 行")

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import queue
 import sys
 import threading
 import traceback
@@ -13,6 +14,7 @@ from datetime import date, datetime, timedelta
 from flask import Flask, jsonify, render_template, request
 
 from catalog_merge import run_catalog_merge
+from roster_fill import run_roster_fill
 
 from fetch_posts import (
     SCRIPT_DIR,
@@ -20,6 +22,7 @@ from fetch_posts import (
     DEFAULT_FIELDS,
     Config,
     authorize,
+    authorize_cfg,
     copy_default_fields,
     field_from_dict,
     load_config,
@@ -36,6 +39,8 @@ from fetch_posts import (
     service_account_email,
     sources_have_changed,
     to_datetime,
+    write_app_log,
+    LOG_DIR,
 )
 
 app = Flask(
@@ -46,13 +51,16 @@ app = Flask(
 
 def _new_job_state() -> dict:
     return {
-    "running": False,
-    "logs": [],
-    "result": None,
-    "error": None,
-    "started_at": None,
-    "finished_at": None,
-    "skipped": False,
+        "running": False,
+        "logs": [],
+        "result": None,
+        "error": None,
+        "started_at": None,
+        "finished_at": None,
+        "skipped": False,
+        "queued": False,
+        "cancel": False,
+        "kind": "",
     }
 
 
@@ -86,6 +94,13 @@ _video_sched = {
     "next_run": None,
     "last_msg": "",
 }
+_catalog_sched = {
+    "enabled": False,
+    "minutes": 180,
+    "only_if_changed": False,
+    "next_run": None,
+    "last_msg": "",
+}
 
 
 def _job_key(cfg=None, explicit: str = "") -> str:
@@ -109,6 +124,8 @@ def job_snapshot(key: str = "default") -> dict:
 def _reset_job(job: dict | None = None) -> None:
     job = job or _job
     job["running"] = True
+    job["queued"] = False
+    job["cancel"] = False
     job["logs"] = []
     job["result"] = None
     job["error"] = None
@@ -117,20 +134,148 @@ def _reset_job(job: dict | None = None) -> None:
     job["finished_at"] = None
 
 
+def _safe_print(text: str) -> None:
+    """Never let Windows GBK consoles abort a job because a sheet title has emoji."""
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        try:
+            print(str(text).encode(encoding, errors="replace").decode(encoding, errors="replace"))
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 def _log(msg: str, job: dict | None = None) -> None:
     job = job or _job
     line = {"t": datetime.now().strftime("%H:%M:%S"), "msg": str(msg)}
-    job["logs"].append(line)
-    print(f"[{line['t']}] {msg}")
+    logs = job.setdefault("logs", [])
+    logs.append(line)
+    extra = len(logs) - 800
+    if extra > 0:
+        del logs[:extra]
+    _safe_print(f"[{line['t']}] {msg}")
+    try:
+        write_app_log(str(msg))
+    except Exception:
+        pass
 
 
 def _record_job_failure(exc: Exception, context: str = "任务", job: dict | None = None) -> None:
-    """Keep exception details local instead of returning them through the web API."""
-    message = f"{context}失败，请查看本机运行日志"
+    detail = str(exc).strip() or exc.__class__.__name__
+    message = f"{context}失败：{detail}"
     job = job or _job
     job["error"] = message
     _log(message, job)
-    print(traceback.format_exc())
+    tb = traceback.format_exc()
+    _safe_print(tb)
+    try:
+        write_app_log(message, tb)
+    except Exception:
+        pass
+
+
+def job_cancelled(job_key: str = "default") -> bool:
+    if _stop_all.is_set():
+        return True
+    job, _lock = _job_parts(job_key)
+    return bool(job.get("cancel"))
+
+
+_run_queue: queue.Queue = queue.Queue()
+_queue_worker: threading.Thread | None = None
+_stop_all = threading.Event()
+
+
+def _queue_worker_loop() -> None:
+    while True:
+        item = _run_queue.get()
+        if item is None:
+            continue
+        kind, cfg, job_key, from_schedule = item
+        job, lock = _job_parts(job_key)
+        if job.get("cancel") or _stop_all.is_set():
+            job["queued"] = False
+            job["running"] = False
+            _log("已跳过（已停止）", job)
+            continue
+        if not lock.acquire(blocking=False):
+            _run_queue.put(item)
+            threading.Event().wait(0.4)
+            continue
+        _reset_job(job)
+        job["kind"] = kind
+        try:
+            if kind == "filter":
+                _run_job(cfg, from_schedule=from_schedule, job_key=job_key)
+            elif kind == "align":
+                _run_align_job(cfg, from_schedule=from_schedule, job_key=job_key)
+            elif kind == "video":
+                _run_video_job(cfg, from_schedule=from_schedule, job_key=job_key)
+            elif kind == "catalog":
+                _run_catalog_job(cfg, job_key=job_key)
+            elif kind == "roster":
+                _run_roster_job(cfg, job_key=job_key)
+            elif kind == "publish":
+                start_publish_job(cfg)
+                lock.release()
+            else:
+                _log(f"未知任务类型 {kind}", job)
+                job["running"] = False
+                if lock.locked():
+                    lock.release()
+        except Exception as exc:
+            _record_job_failure(exc, "队列任务", job)
+            job["running"] = False
+            if lock.locked():
+                lock.release()
+
+
+def _ensure_queue_worker() -> None:
+    global _queue_worker
+    if _queue_worker is None or not _queue_worker.is_alive():
+        _queue_worker = threading.Thread(target=_queue_worker_loop, daemon=True)
+        _queue_worker.start()
+
+
+def enqueue_job(kind: str, cfg: Config, job_key: str = "", from_schedule: bool = False) -> str | None:
+    job_key = _job_key(cfg, job_key)
+    job, _lock = _job_parts(job_key)
+    if job.get("running") or job.get("queued"):
+        return "这个配置已在队列中或正在运行"
+    job["queued"] = True
+    job["cancel"] = False
+    job["kind"] = kind
+    job["error"] = None
+    _log(f"已加入执行队列：{kind}", job)
+    _run_queue.put((kind, cfg, job_key, from_schedule))
+    _ensure_queue_worker()
+    return None
+
+
+def stop_job(job_key: str = "default") -> None:
+    job, _lock = _job_parts(job_key)
+    job["cancel"] = True
+    _log("已请求停止当前任务", job)
+
+
+def stop_all_jobs() -> None:
+    _stop_all.set()
+    for key in list(_jobs):
+        job, _lock = _job_parts(key)
+        job["cancel"] = True
+        job["queued"] = False
+        _log("已请求全部停止", job)
+    while True:
+        try:
+            item = _run_queue.get_nowait()
+            if item:
+                _log("已从队列移除待执行任务", _job_parts(item[2])[0])
+        except queue.Empty:
+            break
+    threading.Timer(1.0, _stop_all.clear).start()
 
 
 def _cfg_from_payload(data: dict) -> Config:
@@ -176,12 +321,28 @@ def _cfg_from_payload(data: dict) -> Config:
         "catalog_output_sheet": "catalog_output_sheet",
         "ui_active_menu": "ui_active_menu",
         "vd_type_filter_mode": "vd_type_filter_mode",
+        "vd_other_category": "vd_other_category",
+        "vd_category_mode": "vd_category_mode",
+        "roster_config_url": "roster_config_url",
+        "roster_config_sheet": "roster_config_sheet",
+        "roster_target_url": "roster_target_url",
+        "roster_traffic_sheet": "roster_traffic_sheet",
     }
     for src, dest in mapping.items():
         if src in data and data[src] is not None:
             setattr(cfg, dest, str(data[src]).strip())
+    if "credentials_files" in data:
+        raw_cf = data.get("credentials_files")
+        if isinstance(raw_cf, str):
+            cfg.credentials_files = [ln.strip() for ln in raw_cf.replace("，", "\n").splitlines() if ln.strip()]
+        elif isinstance(raw_cf, list):
+            cfg.credentials_files = [str(x).strip() for x in raw_cf if str(x).strip()]
+        if cfg.credentials_files and not cfg.credentials_file:
+            cfg.credentials_file = cfg.credentials_files[0]
     if cfg.vd_count_mode not in ("divide_total", "per_video_ceil"):
         cfg.vd_count_mode = "divide_total"
+    if getattr(cfg, "vd_category_mode", "") not in ("columns_plus_other", "other_only"):
+        cfg.vd_category_mode = "columns_plus_other"
     raw_sources = data.get("sources")
     if raw_sources is None:
         raw_sources = data.get("source_urls")
@@ -192,6 +353,13 @@ def _cfg_from_payload(data: dict) -> Config:
     if "align_sources" in data:
         refs = normalize_sources(data.get("align_sources"))
         cfg.align_sources = [{"name": s.name, "url": s.url, "sheet": s.sheet} for s in refs]
+    if "vd_exclude_types" in data:
+        raw_ex = data.get("vd_exclude_types")
+        if isinstance(raw_ex, str):
+            parts = raw_ex.replace("，", "\n").replace(",", "\n").replace(";", "\n").splitlines()
+            cfg.vd_exclude_types = [ln.strip() for ln in parts if ln.strip()]
+        elif isinstance(raw_ex, list):
+            cfg.vd_exclude_types = [str(x).strip() for x in raw_ex if str(x).strip()]
     if "vd_types" in data:
         raw_t = data.get("vd_types")
         if isinstance(raw_t, str):
@@ -199,6 +367,13 @@ def _cfg_from_payload(data: dict) -> Config:
             cfg.vd_types = [ln.strip() for ln in parts if ln.strip()]
         elif isinstance(raw_t, list):
             cfg.vd_types = [str(x).strip() for x in raw_t if str(x).strip()]
+    if "vd_report_categories" in data:
+        raw_rc = data.get("vd_report_categories")
+        if isinstance(raw_rc, str):
+            parts = raw_rc.replace("，", "\n").replace(",", "\n").replace(";", "\n").splitlines()
+            cfg.vd_report_categories = [ln.strip() for ln in parts if ln.strip()]
+        elif isinstance(raw_rc, list):
+            cfg.vd_report_categories = [str(x).strip() for x in raw_rc if str(x).strip()]
     if "align_headers" in data:
         raw_h = data.get("align_headers")
         if isinstance(raw_h, str):
@@ -235,6 +410,16 @@ def _cfg_from_payload(data: dict) -> Config:
             for item in data["vd_columns"]
             if isinstance(item, dict) and str(item.get("column") or "").strip()
         ]
+    if "roster_columns" in data and isinstance(data["roster_columns"], list):
+        cfg.roster_columns = [
+            {
+                "field": str(item.get("field") or item.get("role") or "").strip(),
+                "role": str(item.get("role") or "").strip().lower(),
+                "column": str(item.get("column") or "").strip().upper(),
+            }
+            for item in data["roster_columns"]
+            if isinstance(item, dict) and str(item.get("column") or "").strip() and str(item.get("role") or "").strip()
+        ]
     if "fields" in data and isinstance(data["fields"], list):
         cleaned = []
         for item in data["fields"]:
@@ -256,15 +441,17 @@ def _cfg_from_payload(data: dict) -> Config:
         "align_schedule_enabled",
         "align_schedule_only_if_changed",
         "vd_schedule_enabled",
+        "catalog_schedule_enabled",
         "cf_publish_after_sync",
         "vd_include_headers",
         "catalog_keep_each_header",
         "vd_date_filter_enabled",
         "vd_write_log",
+        "vd_empty_to_other",
     ):
         if flag in data:
             setattr(cfg, flag, bool(data[flag]))
-    for key in ("output_start_row", "hot_start_row", "align_start_row", "align_header_row", "vd_start_row", "vd_out_start_row", "catalog_start_row", "catalog_output_start_row"):
+    for key in ("output_start_row", "hot_start_row", "align_start_row", "align_header_row", "vd_start_row", "vd_out_start_row", "catalog_start_row", "catalog_output_start_row", "roster_start_row", "roster_date_start_row"):
         if key in data and str(data[key]).strip():
             try:
                 setattr(cfg, key, max(1, int(data[key])))
@@ -288,6 +475,11 @@ def _cfg_from_payload(data: dict) -> Config:
     if "vd_schedule_minutes" in data and str(data["vd_schedule_minutes"]).strip() != "":
         try:
             cfg.vd_schedule_minutes = max(5, int(data["vd_schedule_minutes"]))
+        except ValueError:
+            pass
+    if "catalog_schedule_minutes" in data and str(data["catalog_schedule_minutes"]).strip() != "":
+        try:
+            cfg.catalog_schedule_minutes = max(5, int(data["catalog_schedule_minutes"]))
         except ValueError:
             pass
     if "vd_unit_seconds" in data and str(data["vd_unit_seconds"]).strip() != "":
@@ -374,6 +566,10 @@ def _video_schedule_snapshot() -> dict:
     return _snap(_video_sched, "video")
 
 
+def _catalog_schedule_snapshot() -> dict:
+    return _snap(_catalog_sched, "catalog")
+
+
 def _ensure_sched_thread() -> None:
     global _sched_thread
     if _sched_thread is None or not _sched_thread.is_alive():
@@ -392,39 +588,29 @@ def _try_fire(st: dict, kind: str) -> None:
     if datetime.now() < nxt:
         return
     job_key = f"schedule:{kind}"
-    job, lock = _job_parts(job_key)
-    if not lock.acquire(blocking=False):
-        with _sched_lock:
-            st["last_msg"] = "到点时上一轮还在跑，1 分钟后重试"
-            st["next_run"] = datetime.now() + timedelta(minutes=1)
-        return
-    labels = {"filter": "筛选汇总", "align": "表头对齐", "video": "视频时长"}
+    labels = {"filter": "筛选汇总", "align": "表头对齐", "video": "视频时长", "catalog": "目录汇总"}
+    queued = False
     try:
         cfg = load_config()
-        _reset_job(job)
-        _log(f"{labels.get(kind, kind)}定时任务开始（间隔 {minutes} 分钟）", job)
-        if kind == "align":
-            _run_align_job(cfg, from_schedule=True, job_key=job_key)
-        elif kind == "video":
-            _run_video_job(cfg, from_schedule=True, job_key=job_key)
-        else:
-            _run_job(cfg, from_schedule=True, job_key=job_key)
+        err = enqueue_job(kind, cfg, job_key=job_key, from_schedule=True)
+        if err:
+            with _sched_lock:
+                st["last_msg"] = "到点时上一轮还在队列中，1 分钟后重试"
+                st["next_run"] = datetime.now() + timedelta(minutes=1)
+            return
+        queued = True
+        _log(f"{labels.get(kind, kind)}定时任务已排队（间隔 {minutes} 分钟）")
     except Exception as exc:
-        _record_job_failure(exc, f"{labels.get(kind, kind)}定时调度", job)
-        job["running"] = False
-        job["finished_at"] = datetime.now().strftime("%H:%M:%S")
-        if lock.locked():
-            lock.release()
-    finally:
+        _record_job_failure(exc, f"{labels.get(kind, kind)}定时调度")
+    if queued:
         try:
             _remember_schedule_run(kind)
-        except Exception as exc:
-            _log("保存定时状态失败，请查看本机运行日志", job)
+        except Exception:
             print(traceback.format_exc())
         with _sched_lock:
             if st["enabled"]:
                 st["next_run"] = datetime.now() + timedelta(minutes=max(5, st["minutes"]))
-                st["last_msg"] = "已执行" if not job.get("error") else "执行失败，下一轮会重试"
+                st["last_msg"] = "已排队"
             else:
                 st["next_run"] = None
 
@@ -435,6 +621,7 @@ def _scheduler_loop() -> None:
             (_sched, "filter"),
             (_align_sched, "align"),
             (_video_sched, "video"),
+            (_catalog_sched, "catalog"),
         ):
             try:
                 _try_fire(st, kind)
@@ -537,6 +724,30 @@ def stop_video_scheduler() -> None:
         _video_sched["last_msg"] = "已停止"
 
 
+def start_catalog_scheduler(minutes: int) -> None:
+    minutes = max(5, int(minutes))
+    with _sched_lock:
+        preserve_next = (
+            _catalog_sched["enabled"]
+            and _catalog_sched["minutes"] == minutes
+            and isinstance(_catalog_sched["next_run"], datetime)
+        )
+        _catalog_sched["enabled"] = True
+        _catalog_sched["minutes"] = minutes
+        if not preserve_next:
+            delay = timedelta(seconds=12) if _last_run_is_stale(minutes, "catalog") else timedelta(minutes=minutes)
+            _catalog_sched["next_run"] = datetime.now() + delay
+            _catalog_sched["last_msg"] = "已启动，即将执行一次" if delay.seconds == 12 else "已启动"
+    _ensure_sched_thread()
+
+
+def stop_catalog_scheduler() -> None:
+    with _sched_lock:
+        _catalog_sched["enabled"] = False
+        _catalog_sched["next_run"] = None
+        _catalog_sched["last_msg"] = "已停止"
+
+
 @app.get("/")
 def index():
     return render_template("index.html")
@@ -561,6 +772,7 @@ def api_config():
         {
             "config": {
                 "credentials_file": cfg.credentials_file,
+                "credentials_files": cfg.credentials_files or ([cfg.credentials_file] if cfg.credentials_file else []),
                 "target_url": cfg.target_url,
                 "hot_target_url": cfg.hot_target_url,
                 "hot_output_sheet": cfg.hot_output_sheet,
@@ -652,14 +864,8 @@ def api_config():
 
 
 def start_filter_job(cfg: Config, from_schedule: bool = False) -> str | None:
-    job_key = _job_key(cfg)
-    job, lock = _job_parts(job_key)
-    if not lock.acquire(blocking=False):
-        return "这个配置正在运行中，请等它结束"
     save_config(cfg)
-    _reset_job(job)
-    threading.Thread(target=_run_job, args=(cfg, from_schedule, job_key), daemon=True).start()
-    return None
+    return enqueue_job("filter", cfg, from_schedule=from_schedule)
 
 
 def start_publish_job(cfg: Config) -> str | None:
@@ -678,7 +884,7 @@ def start_publish_job(cfg: Config) -> str | None:
                 split_sheet_for_publish,
             )
 
-            gc = authorize(cfg.resolve_credentials())
+            gc = authorize_cfg(cfg)
             src = str(cfg.cf_publish_source or "all").strip().lower()
             if src == "hot":
                 url = cfg.hot_target_url or cfg.target_url
@@ -726,14 +932,8 @@ def start_align_job(cfg: Config, from_schedule: bool = False) -> str | None:
         return "请填写目标表链接"
     if not (cfg.align_mappings or cfg.align_headers):
         return "请配置字段映射"
-    job_key = _job_key(cfg)
-    job, lock = _job_parts(job_key)
-    if not lock.acquire(blocking=False):
-        return "这个配置正在运行中，请等它结束"
     save_config(cfg)
-    _reset_job(job)
-    threading.Thread(target=_run_align_job, args=(cfg, from_schedule, job_key), daemon=True).start()
-    return None
+    return enqueue_job("align", cfg, from_schedule=from_schedule)
 
 
 def _run_video_job(cfg: Config, from_schedule: bool = False, job_key: str = "default") -> None:
@@ -741,7 +941,11 @@ def _run_video_job(cfg: Config, from_schedule: bool = False, job_key: str = "def
     try:
         from video_duration import run_video_duration
 
-        result = run_video_duration(cfg, log=lambda message: _log(message, job))
+        result = run_video_duration(
+            cfg,
+            log=lambda message: _log(message, job),
+            cancelled=lambda: job_cancelled(job_key),
+        )
         job["result"] = result
     except Exception as e:
         _record_job_failure(e, "视频汇总", job)
@@ -757,20 +961,18 @@ def start_video_job(cfg: Config) -> str | None:
         return "请填写视频时长源表链接"
     if not (getattr(cfg, "vd_dest_url", "") or "").strip():
         return "请填写写入目标表格链接"
-    job_key = _job_key(cfg)
-    job, lock = _job_parts(job_key)
-    if not lock.acquire(blocking=False):
-        return "这个配置正在运行中，请等它结束"
     save_config(cfg)
-    _reset_job(job)
-    threading.Thread(target=_run_video_job, args=(cfg, False, job_key), daemon=True).start()
-    return None
+    return enqueue_job("video", cfg)
 
 
 def _run_catalog_job(cfg: Config, job_key: str = "default") -> None:
     job, lock = _job_parts(job_key)
     try:
-        job["result"] = run_catalog_merge(cfg, log=lambda message: _log(message, job))
+        job["result"] = run_catalog_merge(
+            cfg,
+            log=lambda message: _log(message, job),
+            cancelled=lambda: job_cancelled(job_key),
+        )
     except Exception as e:
         _record_job_failure(e, "目录汇总", job)
     finally:
@@ -785,14 +987,34 @@ def start_catalog_job(cfg: Config) -> str | None:
         return "请填写目录表链接"
     if not cfg.catalog_target_url:
         return "请填写目标表链接"
-    job_key = _job_key(cfg)
-    job, lock = _job_parts(job_key)
-    if not lock.acquire(blocking=False):
-        return "这个配置正在运行中，请等它结束"
     save_config(cfg)
-    _reset_job(job)
-    threading.Thread(target=_run_catalog_job, args=(cfg, job_key), daemon=True).start()
-    return None
+    return enqueue_job("catalog", cfg)
+
+
+def _run_roster_job(cfg: Config, job_key: str = "default") -> None:
+    job, lock = _job_parts(job_key)
+    try:
+        job["result"] = run_roster_fill(
+            cfg,
+            log=lambda message: _log(message, job),
+            cancelled=lambda: job_cancelled(job_key),
+        )
+    except Exception as e:
+        _record_job_failure(e, "队别专页汇总", job)
+    finally:
+        job["running"] = False
+        job["finished_at"] = datetime.now().strftime("%H:%M:%S")
+        if lock.locked():
+            lock.release()
+
+
+def start_roster_job(cfg: Config) -> str | None:
+    if not (getattr(cfg, "roster_config_url", "") or "").strip():
+        return "请填写配置表链接"
+    if not (getattr(cfg, "roster_target_url", "") or "").strip():
+        return "请填写写入目标表链接"
+    save_config(cfg)
+    return enqueue_job("roster", cfg)
 
 
 @app.post("/api/run-catalog")
