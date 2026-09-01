@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import os
 import queue
 import sys
@@ -101,6 +102,8 @@ _catalog_sched = {
     "next_run": None,
     "last_msg": "",
 }
+# Per-menu timers so saving/switching another template cannot kill this one.
+_menu_schedules: dict[str, dict] = {}
 
 
 def _job_key(cfg=None, explicit: str = "") -> str:
@@ -278,8 +281,8 @@ def stop_all_jobs() -> None:
     threading.Timer(1.0, _stop_all.clear).start()
 
 
-def _cfg_from_payload(data: dict) -> Config:
-    cfg = load_config()
+def _cfg_from_payload(data: dict, base: Config | None = None) -> Config:
+    cfg = load_config() if base is None else copy.deepcopy(base)
     mapping = {
         "credentials_file": "credentials_file",
         "config_url": "config_url",
@@ -319,6 +322,9 @@ def _cfg_from_payload(data: dict) -> Config:
         "catalog_sheet_col": "catalog_sheet_col",
         "catalog_target_url": "catalog_target_url",
         "catalog_output_sheet": "catalog_output_sheet",
+        "catalog_date_col": "catalog_date_col",
+        "catalog_start_date": "catalog_start_date",
+        "catalog_end_date": "catalog_end_date",
         "ui_active_menu": "ui_active_menu",
         "vd_type_filter_mode": "vd_type_filter_mode",
         "vd_other_category": "vd_other_category",
@@ -366,7 +372,21 @@ def _cfg_from_payload(data: dict) -> Config:
             parts = raw_t.replace("，", "\n").replace(",", "\n").replace(";", "\n").splitlines()
             cfg.vd_types = [ln.strip() for ln in parts if ln.strip()]
         elif isinstance(raw_t, list):
-            cfg.vd_types = [str(x).strip() for x in raw_t if str(x).strip()]
+            cleaned: list = []
+            for item in raw_t:
+                if isinstance(item, dict):
+                    name = str(item.get("name") or item.get("type") or "").strip()
+                    if name:
+                        cleaned.append(
+                            {
+                                "name": name,
+                                "in_total": bool(item.get("in_total", True)),
+                                "in_item": bool(item.get("in_item", True)),
+                            }
+                        )
+                elif str(item).strip():
+                    cleaned.append(str(item).strip())
+            cfg.vd_types = cleaned
     if "vd_report_categories" in data:
         raw_rc = data.get("vd_report_categories")
         if isinstance(raw_rc, str):
@@ -374,6 +394,13 @@ def _cfg_from_payload(data: dict) -> Config:
             cfg.vd_report_categories = [ln.strip() for ln in parts if ln.strip()]
         elif isinstance(raw_rc, list):
             cfg.vd_report_categories = [str(x).strip() for x in raw_rc if str(x).strip()]
+    if "catalog_exclude_sheets" in data:
+        raw_exs = data.get("catalog_exclude_sheets")
+        if isinstance(raw_exs, str):
+            parts = raw_exs.replace("，", "\n").replace(",", "\n").replace(";", "\n").splitlines()
+            cfg.catalog_exclude_sheets = [ln.strip() for ln in parts if ln.strip()]
+        elif isinstance(raw_exs, list):
+            cfg.catalog_exclude_sheets = [str(x).strip() for x in raw_exs if str(x).strip()]
     if "align_headers" in data:
         raw_h = data.get("align_headers")
         if isinstance(raw_h, str):
@@ -445,6 +472,9 @@ def _cfg_from_payload(data: dict) -> Config:
         "cf_publish_after_sync",
         "vd_include_headers",
         "catalog_keep_each_header",
+        "catalog_add_source",
+        "catalog_skip_existing",
+        "catalog_date_filter_enabled",
         "vd_date_filter_enabled",
         "vd_write_log",
         "vd_empty_to_other",
@@ -543,14 +573,15 @@ def _remember_schedule_run(kind: str) -> None:
 
 
 def _snap(st: dict, kind: str) -> dict:
-    nxt = st["next_run"]
+    nxt = st.get("next_run")
     return {
-        "enabled": st["enabled"],
-        "minutes": st["minutes"],
-        "only_if_changed": st["only_if_changed"],
+        "enabled": bool(st.get("enabled")),
+        "minutes": st.get("minutes"),
+        "only_if_changed": st.get("only_if_changed"),
         "next_run": nxt.strftime("%Y-%m-%d %H:%M:%S") if isinstance(nxt, datetime) else "",
-        "last_msg": st["last_msg"],
+        "last_msg": st.get("last_msg") or "",
         "last_sync": _schedule_last_run(kind),
+        "menu_id": st.get("menu_id") or "",
     }
 
 
@@ -570,6 +601,14 @@ def _catalog_schedule_snapshot() -> dict:
     return _snap(_catalog_sched, "catalog")
 
 
+def menu_schedule_snapshot(menu_id: str) -> dict:
+    with _sched_lock:
+        st = _menu_schedules.get(str(menu_id) or "")
+        if not st:
+            return {"enabled": False, "minutes": 0, "only_if_changed": False, "next_run": "", "last_msg": "", "menu_id": menu_id}
+        return _snap(st, f"menu:{menu_id}")
+
+
 def _ensure_sched_thread() -> None:
     global _sched_thread
     if _sched_thread is None or not _sched_thread.is_alive():
@@ -578,20 +617,153 @@ def _ensure_sched_thread() -> None:
         _sched_thread.start()
 
 
-def _try_fire(st: dict, kind: str) -> None:
+def _template_schedule_kind(template: str) -> str | None:
+    return {
+        "filter": "filter",
+        "align": "align",
+        "video": "video",
+        "custom": "video",
+        "catalog": "catalog",
+    }.get(str(template or ""))
+
+
+def _menu_schedule_spec(item: dict) -> dict | None:
+    if not isinstance(item, dict):
+        return None
+    template = str(item.get("template") or "")
+    kind = _template_schedule_kind(template)
+    settings = item.get("settings") if isinstance(item.get("settings"), dict) else {}
+    if not kind:
+        return None
+    try:
+        if kind == "filter":
+            enabled = bool(settings.get("schedule_enabled"))
+            minutes = int(settings.get("schedule_minutes") or 60)
+            only = bool(settings.get("schedule_only_if_changed"))
+        elif kind == "align":
+            enabled = bool(settings.get("align_schedule_enabled"))
+            minutes = int(settings.get("align_schedule_minutes") or 60)
+            only = bool(settings.get("align_schedule_only_if_changed"))
+        elif kind == "video":
+            enabled = bool(settings.get("vd_schedule_enabled"))
+            minutes = int(settings.get("vd_schedule_minutes") or 180)
+            only = False
+            if not str(settings.get("vd_source_url") or "").strip() or not str(settings.get("vd_dest_url") or "").strip():
+                enabled = False
+        else:
+            enabled = bool(settings.get("catalog_schedule_enabled"))
+            minutes = int(settings.get("catalog_schedule_minutes") or 180)
+            only = False
+            if not str(settings.get("catalog_index_url") or "").strip() or not str(settings.get("catalog_target_url") or "").strip():
+                enabled = False
+    except (TypeError, ValueError):
+        return None
+    if not enabled:
+        return None
+    return {
+        "kind": kind,
+        "minutes": max(5, minutes),
+        "only_if_changed": only,
+        "template": template,
+        "menu_id": str(item.get("id") or ""),
+    }
+
+
+def _cfg_for_menu_id(menu_id: str) -> Config:
+    stored = load_config()
+    item = next((entry for entry in (stored.ui_menus or []) if str(entry.get("id") or "") == str(menu_id)), None)
+    if not item:
+        stored.ui_active_menu = menu_id
+        return stored
+    cfg = _cfg_from_payload(item.get("settings") or {}, base=Config())
+    cfg.ui_menus = stored.ui_menus
+    cfg.ui_active_menu = menu_id
+    if not getattr(cfg, "credentials_file", ""):
+        cfg.credentials_file = stored.credentials_file
+    if not getattr(cfg, "credentials_files", None):
+        cfg.credentials_files = list(stored.credentials_files or [])
+    return cfg
+
+
+def _mirror_kind_schedules_locked() -> None:
+    first: dict[str, dict] = {}
+    for st in _menu_schedules.values():
+        kind = st.get("kind")
+        if kind and kind not in first:
+            first[kind] = st
+    mapping = {
+        "filter": _sched,
+        "align": _align_sched,
+        "video": _video_sched,
+        "catalog": _catalog_sched,
+    }
+    for kind, slot in mapping.items():
+        src = first.get(kind)
+        if src:
+            slot["enabled"] = True
+            slot["minutes"] = src["minutes"]
+            slot["only_if_changed"] = src.get("only_if_changed", False)
+            slot["next_run"] = src.get("next_run")
+            slot["last_msg"] = src.get("last_msg") or ""
+            slot["menu_id"] = src.get("menu_id") or ""
+        else:
+            slot["enabled"] = False
+            slot["next_run"] = None
+            slot["last_msg"] = "已停止"
+            slot["menu_id"] = ""
+
+
+def sync_schedulers_from_menus(menus: list | None) -> None:
+    """Start/keep timers from every menu that has them. Saving another menu will not stop these."""
+    specs: dict[str, dict] = {}
+    for item in menus or []:
+        spec = _menu_schedule_spec(item)
+        if spec and spec.get("menu_id"):
+            specs[spec["menu_id"]] = spec
+    now = datetime.now()
     with _sched_lock:
-        enabled = st["enabled"]
-        nxt = st["next_run"]
-        minutes = st["minutes"]
+        for mid in list(_menu_schedules):
+            if mid not in specs:
+                _menu_schedules.pop(mid, None)
+        for mid, spec in specs.items():
+            old = _menu_schedules.get(mid)
+            keep = (
+                old
+                and old.get("enabled")
+                and old.get("minutes") == spec["minutes"]
+                and isinstance(old.get("next_run"), datetime)
+            )
+            if keep:
+                old.update(spec)
+                old["enabled"] = True
+                continue
+            stale = _last_run_is_stale(spec["minutes"], f"menu:{mid}")
+            _menu_schedules[mid] = {
+                **spec,
+                "enabled": True,
+                "next_run": now + (timedelta(seconds=12) if stale else timedelta(minutes=spec["minutes"])),
+                "last_msg": "已启动，即将执行一次" if stale else "已启动",
+            }
+        _mirror_kind_schedules_locked()
+    if specs:
+        _ensure_sched_thread()
+
+
+def _try_fire(st: dict, kind: str, job_key: str = "", cfg_factory=None) -> None:
+    with _sched_lock:
+        enabled = st.get("enabled")
+        nxt = st.get("next_run")
+        minutes = st.get("minutes") or 60
+        menu_id = st.get("menu_id") or ""
     if not enabled or not isinstance(nxt, datetime):
         return
     if datetime.now() < nxt:
         return
-    job_key = f"schedule:{kind}"
+    job_key = job_key or menu_id or f"schedule:{kind}"
     labels = {"filter": "筛选汇总", "align": "表头对齐", "video": "视频时长", "catalog": "目录汇总"}
     queued = False
     try:
-        cfg = load_config()
+        cfg = cfg_factory() if cfg_factory else ( _cfg_for_menu_id(menu_id) if menu_id else load_config() )
         err = enqueue_job(kind, cfg, job_key=job_key, from_schedule=True)
         if err:
             with _sched_lock:
@@ -605,18 +777,36 @@ def _try_fire(st: dict, kind: str) -> None:
     if queued:
         try:
             _remember_schedule_run(kind)
+            if menu_id:
+                _remember_schedule_run(f"menu:{menu_id}")
         except Exception:
             print(traceback.format_exc())
         with _sched_lock:
-            if st["enabled"]:
-                st["next_run"] = datetime.now() + timedelta(minutes=max(5, st["minutes"]))
+            if st.get("enabled"):
+                st["next_run"] = datetime.now() + timedelta(minutes=max(5, int(st.get("minutes") or minutes)))
                 st["last_msg"] = "已排队"
             else:
                 st["next_run"] = None
+            _mirror_kind_schedules_locked()
 
 
 def _scheduler_loop() -> None:
     while not _sched_stop.wait(5):
+        with _sched_lock:
+            menu_items = list(_menu_schedules.items())
+        if menu_items:
+            for mid, st in menu_items:
+                try:
+                    _try_fire(st, st.get("kind") or "filter", job_key=mid)
+                except Exception:
+                    _log(f"定时器异常（{mid}），请查看本机运行日志")
+                    print(traceback.format_exc())
+                    with _sched_lock:
+                        if st.get("enabled"):
+                            st["next_run"] = datetime.now() + timedelta(minutes=1)
+                            st["last_msg"] = "定时器异常，1 分钟后重试"
+                            _mirror_kind_schedules_locked()
+            continue
         for st, kind in (
             (_sched, "filter"),
             (_align_sched, "align"),
@@ -748,6 +938,12 @@ def stop_catalog_scheduler() -> None:
         _catalog_sched["last_msg"] = "已停止"
 
 
+def stop_all_menu_schedulers() -> None:
+    with _sched_lock:
+        _menu_schedules.clear()
+        _mirror_kind_schedules_locked()
+
+
 @app.get("/")
 def index():
     return render_template("index.html")
@@ -846,6 +1042,13 @@ def api_config():
                 "catalog_output_sheet": cfg.catalog_output_sheet,
                 "catalog_output_start_row": cfg.catalog_output_start_row,
                 "catalog_keep_each_header": cfg.catalog_keep_each_header,
+                "catalog_add_source": cfg.catalog_add_source,
+                "catalog_skip_existing": cfg.catalog_skip_existing,
+                "catalog_date_filter_enabled": cfg.catalog_date_filter_enabled,
+                "catalog_date_col": cfg.catalog_date_col,
+                "catalog_start_date": cfg.catalog_start_date,
+                "catalog_end_date": cfg.catalog_end_date,
+                "catalog_exclude_sheets": cfg.catalog_exclude_sheets,
                 "ui_menus": cfg.ui_menus,
                 "ui_active_menu": cfg.ui_active_menu,
                 "cf_publish_url": cfg.cf_publish_url,

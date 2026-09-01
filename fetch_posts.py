@@ -176,28 +176,17 @@ def safe_resize_ws(ws, rows: int, cols: int, log: LogFn = print) -> None:
             _resize(rows, cols, "调整工作表大小")
         return
 
-    ss = getattr(ws, "spreadsheet", None)
-    other = 0
-    if ss is not None:
-        try:
-            other = workbook_cell_count(ss) - current_rows * current_cols
-        except Exception:
-            other = 0
-    room = MAX_WORKBOOK_CELLS - CELL_SAFETY - max(0, other)
-    needed = rows * cols
-    if needed > room:
-        raise RuntimeError(
-            f"目标表将超过 Google 表格 1000 万单元格上限（需要 {rows}×{cols}={needed}，"
-            f"工作簿里其他工作表大约已占 {max(0, other)} 格）。"
-            "请换一个空表格当目标，或删掉目标文件里不用的工作表和空白列后再汇总。"
-        )
+    # Incremental growth: only the added cells count against the 10M cap.
+    # Comparing the full new size against leftover room minus a 200k safety
+    # incorrectly blocked a 1000-row append and then wiped the sheet to 1×1.
     try:
-        _resize(rows, cols, "扩大工作表")
+        _resize(max(current_rows, rows), max(current_cols, cols), "扩大工作表")
+        return
     except Exception as exc:
         text = str(exc)
         if "10000000" in text or "number of cells" in text.lower():
             raise RuntimeError(
-                "目标表单元格超过 Google 1000 万上限。请换空表格，或先删掉目标文件里过大的工作表。"
+                "目标表单元格超过 Google 1000 万上限。请换空表格，或先删掉目标文件里过大的工作表和空白列。"
             ) from exc
         raise
 
@@ -360,6 +349,13 @@ class Config:
     catalog_output_sheet: str = "目录汇总"
     catalog_output_start_row: int = 1
     catalog_keep_each_header: bool = False
+    catalog_add_source: bool = True
+    catalog_skip_existing: bool = True
+    catalog_date_filter_enabled: bool = True
+    catalog_date_col: str = ""
+    catalog_start_date: str = ""
+    catalog_end_date: str = ""
+    catalog_exclude_sheets: list[str] = field(default_factory=list)
     catalog_schedule_enabled: bool = False
     catalog_schedule_minutes: int = 180
     # 队别专页 / 引流对照：配置表字段映射后，按队别分 sheet 写入。

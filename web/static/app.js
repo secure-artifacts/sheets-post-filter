@@ -10,7 +10,7 @@ const templateNames = {
 
 const scalarFields = {
   filter: ["credentials_file", "target_url", "hot_target_url", "output_sheet", "hot_output_sheet", "output_start_row", "hot_start_row", "start_date", "end_date", "likes_threshold", "schedule_minutes", "exclude_id_value", "date_field", "sort_field", "cf_publish_url", "cf_publish_secret", "cf_publish_source"],
-  catalog: ["catalog_index_url", "catalog_index_sheet", "catalog_start_row", "catalog_url_col", "catalog_sheet_col", "catalog_target_url", "catalog_output_sheet", "catalog_output_start_row"],
+  catalog: ["catalog_index_url", "catalog_index_sheet", "catalog_start_row", "catalog_url_col", "catalog_sheet_col", "catalog_target_url", "catalog_output_sheet", "catalog_output_start_row", "catalog_exclude_sheets", "catalog_date_col", "catalog_start_date", "catalog_end_date"],
   align: ["align_target_url", "align_output_sheet", "align_start_row", "align_source_sheet", "align_header_row", "align_schedule_minutes"],
   video: ["vd_source_url", "vd_source_sheets", "vd_start_row", "vd_col_date", "vd_col_link", "vd_col_name", "vd_col_type", "vd_types", "vd_start_date", "vd_end_date", "vd_type_filter_mode", "vd_dest_url", "vd_report_sheet", "vd_log_sheet", "vd_out_start_row", "vd_count_mode", "vd_unit_seconds", "vd_batch_size", "vd_schedule_minutes"],
   custom: ["vd_source_url", "vd_source_sheets", "vd_start_row", "vd_col_date", "vd_col_link", "vd_col_name", "vd_col_type", "vd_types", "vd_start_date", "vd_end_date", "vd_type_filter_mode", "vd_dest_url", "vd_report_sheet", "vd_log_sheet", "vd_out_start_row", "vd_count_mode", "vd_unit_seconds", "vd_batch_size", "vd_schedule_minutes"],
@@ -18,7 +18,7 @@ const scalarFields = {
 
 const checkFields = {
   filter: ["include_headers", "hot_include_headers", "add_source_column", "sort_descending", "write_all", "write_hot", "upsert_by_id", "schedule_enabled", "schedule_only_if_changed", "cf_publish_after_sync"],
-  catalog: ["catalog_keep_each_header"],
+  catalog: ["catalog_keep_each_header", "catalog_add_source", "catalog_skip_existing", "catalog_date_filter_enabled"],
   align: ["align_include_headers", "align_schedule_enabled", "align_schedule_only_if_changed"],
   video: ["vd_date_filter_enabled", "vd_write_log", "vd_include_headers", "vd_schedule_enabled"],
   custom: ["vd_date_filter_enabled", "vd_write_log", "vd_include_headers", "vd_schedule_enabled"],
@@ -281,6 +281,7 @@ function collectTemplate(template) {
   if (template === "filter") { data.sources = readSources("sourceRows"); data.source_urls = data.sources.map((source) => source.url); data.fields = readFieldMaps(); }
   if (template === "align") { saveCurrentMappingProfile(); data.align_sources = readSources("alignSourceRows"); data.align_mappings = defaultMappings; data.align_headers = defaultMappings.map((item) => item.target); data.align_mapping_profiles = mappingProfiles; }
   if (template === "video" || template === "custom") { data.vd_source_sheets = $("vd_source_sheets").value.split(/\r?\n|，|,/).map((x) => x.trim()).filter(Boolean); data.vd_types = $("vd_types").value.split(/\r?\n|，|,/).map((x) => x.trim()).filter(Boolean); data.vd_columns = readVdColumns(); data.vd_write_log = template === "video"; }
+  if (template === "catalog") { data.catalog_exclude_sheets = ($("catalog_exclude_sheets")?.value || "").split(/\r?\n|，|,/).map((x) => x.trim()).filter(Boolean); }
   return data;
 }
 
@@ -368,7 +369,7 @@ async function poll() {
   const result = state.result;
   setState(result.ok ? "ok" : "bad", result.ok ? "完成" : "部分失败");
   const failed = (result.sources || []).filter((item) => item.error).length;
-  if (result.mode === "catalog") { showMessage(`目录汇总写入 ${result.total_rows} 行${failed ? ` · ${failed} 项失败` : ""}`); if (result.target_url) { $("openCatalog").href = result.target_url; $("openCatalog").hidden = false; } }
+  if (result.mode === "catalog") { showMessage(`目录汇总已结束：本轮新增 ${result.total_rows || 0} 行，目标表一共 ${result.sheet_total || result.total_rows || 0} 行${failed ? ` · ${failed} 项失败` : ""}`); if (result.target_url) { $("openCatalog").href = result.target_url; $("openCatalog").hidden = false; } }
   else if (result.mode === "align") { showMessage(`字段映射写入 ${result.total_rows} 行${failed ? ` · ${failed} 个源失败` : ""}`); if (result.target_url) { $("openAlign").href = result.target_url; $("openAlign").hidden = false; } }
   else if (result.mode === "video" || result.mode === "video_custom") { showMessage(`${result.mode === "video_custom" ? "分类条数" : "视频时长"}数据表已更新 · ${result.people || 0} 人 · 本次 ${result.appended || 0} 条`); if (result.target_url) { $("openVideo").href = result.target_url; $("openVideo").hidden = false; } }
   else if (result.mode === "cloudflare") showMessage(result.skipped ? "内容未变化，已跳过发布" : `图库已发布 ${result.totalRows || 0} 条`);

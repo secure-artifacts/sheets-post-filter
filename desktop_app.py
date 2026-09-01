@@ -21,6 +21,7 @@ from fetch_posts import (
     LOG_DIR,
     RESOURCE_DIR,
     SCRIPT_DIR,
+    Config,
     authorize,
     copy_default_fields,
     load_config,
@@ -35,6 +36,7 @@ from app import (
     _catalog_schedule_snapshot,
     _cfg_from_payload,
     job_snapshot,
+    menu_schedule_snapshot,
     _schedule_snapshot,
     _video_schedule_snapshot,
     start_align_job,
@@ -49,10 +51,12 @@ from app import (
     start_video_scheduler,
     stop_align_scheduler,
     stop_all_jobs,
+    stop_all_menu_schedulers,
     stop_catalog_scheduler,
     stop_job,
     stop_scheduler,
     stop_video_scheduler,
+    sync_schedulers_from_menus,
 )
 from version import APP_VERSION, RELEASES_URL, UPDATE_API_URL, version_tuple
 
@@ -239,17 +243,23 @@ class DesktopApp(tk.Tk):
         self._vd_exclude_rows: list[tk.Frame] = []
         self._vd_report_rows: list[tk.Frame] = []
         self._vd_extra_col_rows: list[tk.Frame] = []
+        self._catalog_exclude_rows: list[tk.Frame] = []
         self._alive = True
         self._tick_id = None
         self._vd_ui_mode = ""
         self._menus: list[dict] = []
         self._menu_buttons: dict[str, tk.Button] = {}
         self._active_menu_id = ""
+        self._selecting_menu = False
+        self._scroll_pages: list[tk.Frame] = []
         self._align_profiles: dict[str, list[dict]] = {}
         self._align_profile_key = "__default__"
         self._align_default_mappings: list[dict] = []
         self.var_credentials = tk.StringVar()
         self._tab = "filter"
+        self._tick_cache: dict[str, str] = {}
+        self._sa_files_shown: list[str] | None = None
+        self._pending_select: dict | None = None
         self.title("数据汇总工具")
         self.geometry("1180x820+80+40")
         self.minsize(980, 680)
@@ -262,16 +272,8 @@ class DesktopApp(tk.Tk):
                 except Exception:
                     pass
         self._build()
-        self._load_cfg(self.cfg)
         self._init_menus()
-        if self.cfg.schedule_enabled:
-            start_scheduler(self.cfg.schedule_minutes, self.cfg.schedule_only_if_changed)
-        if self.cfg.align_schedule_enabled:
-            start_align_scheduler(self.cfg.align_schedule_minutes, self.cfg.align_schedule_only_if_changed)
-        if self.cfg.vd_schedule_enabled and self.cfg.vd_source_url and self.cfg.vd_dest_url:
-            start_video_scheduler(self.cfg.vd_schedule_minutes)
-        if getattr(self.cfg, "catalog_schedule_enabled", False) and self.cfg.catalog_index_url and self.cfg.catalog_target_url:
-            start_catalog_scheduler(self.cfg.catalog_schedule_minutes)
+        self._sync_schedulers()
         self._tick_id = self.after(300, self._tick)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -357,7 +359,10 @@ class DesktopApp(tk.Tk):
         canvas = tk.Canvas(wrap, bg=C["paper"], highlightthickness=0)
         bar = ttk.Scrollbar(wrap, orient="vertical", command=canvas.yview)
         inner = tk.Frame(canvas, bg=C["paper"])
-        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        def _on_inner(_e=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        inner.bind("<Configure>", _on_inner)
         win = canvas.create_window((0, 0), window=inner, anchor="nw")
         canvas.configure(yscrollcommand=bar.set)
         canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win, width=e.width))
@@ -370,7 +375,26 @@ class DesktopApp(tk.Tk):
         inner.bind("<MouseWheel>", wheel)
         canvas.pack(side="left", fill="both", expand=True)
         bar.pack(side="right", fill="y")
+        wrap._canvas = canvas
+        wrap._inner = inner
+        wrap._on_inner = _on_inner
+        self._scroll_pages.append(wrap)
         return wrap, inner
+
+    def _suspend_layout(self) -> None:
+        for wrap in self._scroll_pages:
+            try:
+                wrap._inner.unbind("<Configure>")
+            except Exception:
+                pass
+
+    def _resume_layout(self) -> None:
+        for wrap in self._scroll_pages:
+            try:
+                wrap._inner.bind("<Configure>", wrap._on_inner)
+                wrap._canvas.configure(scrollregion=wrap._canvas.bbox("all"))
+            except Exception:
+                pass
 
     # ----- build -----
     def _build(self) -> None:
@@ -435,7 +459,15 @@ class DesktopApp(tk.Tk):
         StyleBtn(sa_actions, "ghost", text="移除末个", command=self._remove_last_credential, bg=C["sa"], fg=C["cream"]).pack(side="left")
 
         self.status = tk.StringVar(value="待命")
-        tk.Label(self, textvariable=self.status, bg=C["paper"], fg=C["head"], font=FB).pack(anchor="w", padx=18, pady=(10, 0))
+        tk.Label(
+            self,
+            textvariable=self.status,
+            bg=C["paper"],
+            fg=C["head"],
+            font=FB,
+            wraplength=1100,
+            justify="left",
+        ).pack(anchor="w", padx=18, pady=(10, 0))
 
         body = tk.Frame(self, bg=C["paper"])
         body.pack(fill="both", expand=True, pady=(6, 0))
@@ -446,12 +478,36 @@ class DesktopApp(tk.Tk):
         side_head.pack(fill="x", padx=12, pady=(14, 8))
         tk.Label(side_head, text="配置菜单", bg=C["sa"], fg=C["cream"], font=FB).pack(side="left")
         StyleBtn(side_head, "head", text="＋", command=self._add_menu, padx=9, pady=3).pack(side="right")
-        self.menu_box = tk.Frame(self.sidebar, bg=C["sa"])
-        self.menu_box.pack(fill="both", expand=True, padx=8)
         side_actions = tk.Frame(self.sidebar, bg=C["sa"])
-        side_actions.pack(fill="x", padx=8, pady=10)
-        StyleBtn(side_actions, "head", text="修改名称", command=self._rename_menu, padx=8, pady=4).pack(side="left")
-        StyleBtn(side_actions, "head", text="删除", command=self._delete_menu, padx=8, pady=4).pack(side="right")
+        side_actions.pack(side="bottom", fill="x", padx=8, pady=(6, 12))
+        StyleBtn(
+            side_actions, "ghost", text="修改名称", command=self._rename_menu,
+            bg="#0f766e", fg=C["cream"], activebackground="#14b8a6", activeforeground=C["cream"],
+            padx=8, pady=5,
+        ).pack(side="left")
+        StyleBtn(
+            side_actions, "ghost", text="删除", command=self._delete_menu,
+            bg="#0f766e", fg=C["cream"], activebackground="#e11d48", activeforeground="white",
+            padx=8, pady=5,
+        ).pack(side="right")
+        menu_wrap = tk.Frame(self.sidebar, bg=C["sa"])
+        menu_wrap.pack(fill="both", expand=True, padx=8)
+        self._menu_canvas = tk.Canvas(menu_wrap, bg=C["sa"], highlightthickness=0, bd=0)
+        menu_bar = ttk.Scrollbar(menu_wrap, orient="vertical", command=self._menu_canvas.yview)
+        self.menu_box = tk.Frame(self._menu_canvas, bg=C["sa"])
+        self._menu_canvas_win = self._menu_canvas.create_window((0, 0), window=self.menu_box, anchor="nw")
+        self._menu_canvas.configure(yscrollcommand=menu_bar.set)
+        self.menu_box.bind("<Configure>", lambda _e: self._menu_canvas.configure(scrollregion=self._menu_canvas.bbox("all")))
+        self._menu_canvas.bind("<Configure>", lambda e: self._menu_canvas.itemconfigure(self._menu_canvas_win, width=e.width))
+
+        def _menu_wheel(event):
+            self._menu_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            return "break"
+
+        self._menu_canvas.bind("<MouseWheel>", _menu_wheel)
+        self.menu_box.bind("<MouseWheel>", _menu_wheel)
+        self._menu_canvas.pack(side="left", fill="both", expand=True)
+        menu_bar.pack(side="right", fill="y")
 
         right = tk.Frame(body, bg=C["paper"])
         right.pack(side="left", fill="both", expand=True)
@@ -622,27 +678,60 @@ class DesktopApp(tk.Tk):
             )
             btn.pack(side="left", fill="x", expand=True)
             btn.bind("<Double-Button-1>", lambda _event, menu_id=item["id"]: self._rename_menu(menu_id))
+            btn.bind("<MouseWheel>", lambda e: self._menu_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units") or "break")
             self._menu_buttons[item["id"]] = btn
+
+    def _store_current_menu_settings(self) -> None:
+        current = next((item for item in self._menus if item["id"] == self._active_menu_id), None)
+        if not current:
+            return
+        settings = current.setdefault("settings", {})
+        settings.update(self._settings_slice(current.get("template") or "filter"))
 
     def _select_menu(self, menu_id: str, initial: bool = False) -> None:
         if menu_id == self._active_menu_id and not initial:
             return
-        if self._active_menu_id and not initial:
-            current = next((item for item in self._menus if item["id"] == self._active_menu_id), None)
-            if current:
-                current["settings"] = copy.deepcopy(self._payload())
         item = next((entry for entry in self._menus if entry["id"] == menu_id), None)
         if not item:
             return
+        if self._selecting_menu:
+            self._active_menu_id = menu_id
+            self._pending_select = item
+            self._highlight_menu_buttons()
+            self.status.set(f"当前配置：{item['name']}")
+            return
+        if self._active_menu_id and not initial:
+            self._store_current_menu_settings()
+        self._selecting_menu = True
         self._active_menu_id = menu_id
-        settings = copy.deepcopy(item.get("settings") or {})
-        self._vd_ui_mode = ""
-        self._load_cfg(_cfg_from_payload(settings))
-        self._show_tab(item["template"])
-        job = job_snapshot(menu_id)
-        self._log_n = len(job.get("logs") or [])
+        self._pending_select = item
         self._highlight_menu_buttons()
         self.status.set(f"当前配置：{item['name']}")
+        if initial:
+            self._apply_selected_menu(item)
+            self._pending_select = None
+            self._selecting_menu = False
+            return
+        self.after_idle(self._finish_select)
+
+    def _finish_select(self, item: dict | None = None) -> None:
+        try:
+            target = self._pending_select or item
+            self._pending_select = None
+            if not target or target.get("id") != self._active_menu_id:
+                return
+            self._apply_selected_menu(target)
+        finally:
+            self._selecting_menu = False
+
+    def _apply_selected_menu(self, item: dict) -> None:
+        template = item.get("template") or "filter"
+        if template not in ("video", "custom"):
+            self._vd_ui_mode = ""
+        self._apply_settings_slice(item.get("settings") or {}, template)
+        self._show_tab(template)
+        job = job_snapshot(item.get("id") or "")
+        self._log_n = len(job.get("logs") or [])
 
     def _highlight_menu_buttons(self) -> None:
         for menu_id, btn in self._menu_buttons.items():
@@ -659,15 +748,60 @@ class DesktopApp(tk.Tk):
         name = simpledialog.askstring("修改菜单名称", "新名称：", initialvalue=item["name"], parent=self)
         if name and name.strip():
             item["name"] = name.strip()
-            self._render_menu_buttons()
+            labels = {"filter": "贴文模板", "catalog": "目录模板", "align": "映射模板", "video": "时长模板", "custom": "自定义模板", "roster": "专页模板"}
+            btn = self._menu_buttons.get(menu_id)
+            if btn:
+                btn.configure(text=f"{item['name']}\n  {labels.get(item['template'], '')}")
+            else:
+                self._render_menu_buttons()
+
+    def _pick_template(self) -> str:
+        win = tk.Toplevel(self)
+        win.title("新增配置菜单")
+        win.transient(self)
+        win.configure(bg=C["paper"])
+        win.resizable(False, False)
+        tk.Label(win, text="选择模板类型", bg=C["paper"], fg=C["ink"], font=FB).pack(anchor="w", padx=18, pady=(16, 8))
+        chosen: dict[str, str] = {}
+        options = (
+            ("filter", "贴文筛选汇总", "按日期、点赞筛选贴文库"),
+            ("catalog", "目录表驱动汇总", "按目录表列出的表格合并写入"),
+            ("align", "字段映射 / 表头对齐", "把多张表按字段对齐"),
+            ("video", "视频提取时长", "读视频链接，写日志表和数据表"),
+            ("custom", "自定义数据汇总", "按分类每天计数，不写日志、不算时长"),
+        )
+
+        def pick(key: str) -> None:
+            chosen["template"] = key
+            win.destroy()
+
+        for key, title, desc in options:
+            btn = tk.Button(
+                win,
+                text=f"{title}\n{desc}",
+                command=lambda k=key: pick(k),
+                anchor="w",
+                justify="left",
+                bg=C["card"],
+                fg=C["ink"],
+                activebackground="#ccfbf1",
+                relief="solid",
+                bd=1,
+                padx=14,
+                pady=10,
+                font=F,
+                cursor="hand2",
+            )
+            btn.pack(fill="x", padx=18, pady=4)
+        StyleBtn(win, "ghost", text="取消", command=win.destroy).pack(anchor="e", padx=18, pady=(8, 16))
+        win.update_idletasks()
+        win.geometry(f"+{self.winfo_rootx() + 80}+{self.winfo_rooty() + 80}")
+        win.grab_set()
+        self.wait_window(win)
+        return chosen.get("template") or ""
 
     def _add_menu(self) -> None:
-        choice = simpledialog.askstring(
-            "新增配置菜单",
-            "选择模板：\n1 贴文筛选汇总\n2 目录表驱动汇总\n3 字段映射 / 表头对齐\n4 视频提取时长（保留日志）\n5 自定义数据汇总（不写日志）\n\n请输入 1-5：",
-            parent=self,
-        )
-        template = {"1": "filter", "2": "catalog", "3": "align", "4": "video", "5": "custom"}.get((choice or "").strip())
+        template = self._pick_template()
         if not template:
             return
         labels = {"filter": "贴文筛选汇总", "catalog": "目录表驱动汇总", "align": "字段映射 / 表头对齐", "video": "视频提取时长", "custom": "自定义数据汇总"}
@@ -678,8 +812,11 @@ class DesktopApp(tk.Tk):
         settings = copy.deepcopy(source.get("settings") if source else self._payload())
         if template in ("video", "custom"):
             settings["vd_write_log"] = template == "video"
+            settings.setdefault("vd_types", [])
+            settings.setdefault("vd_report_categories", [])
         menu_id = f"{template}-{int(datetime.now().timestamp() * 1000)}"
         self._menus.append({"id": menu_id, "name": name.strip(), "template": template, "settings": settings})
+        self._render_menu_buttons()
         self._select_menu(menu_id)
 
     def _delete_menu(self) -> None:
@@ -691,7 +828,9 @@ class DesktopApp(tk.Tk):
             return
         self._menus = [entry for entry in self._menus if entry["id"] != self._active_menu_id]
         self._active_menu_id = ""
+        self._render_menu_buttons()
         self._select_menu(self._menus[0]["id"], initial=True)
+        self._sync_schedulers()
 
     def _src_table(self, parent, headers, add_text, rows_attr, name_ph):
         head = tk.Frame(parent, bg="#efe8d8")
@@ -755,31 +894,68 @@ class DesktopApp(tk.Tk):
         return out
 
     def _set_src(self, box, rows_attr, name_ph, count, items, align=False):
-        for r in list(getattr(self, rows_attr)):
-            r.destroy()
-        setattr(self, rows_attr, [])
-        items = items or []
-        if not items:
-            self._add_src_row(box, rows_attr, name_ph, count)
-            self._add_src_row(box, rows_attr, name_ph, count)
-            return
-        for s in items:
-            if isinstance(s, str):
-                self._add_src_row(box, rows_attr, name_ph, count, "", s)
+        parsed: list[tuple[str, str]] = []
+        for item in items or []:
+            if isinstance(item, str):
+                parsed.append(("", item))
+            elif isinstance(item, dict):
+                parsed.append((str(item.get("sheet") or item.get("name") or ""), str(item.get("url") or "")))
+        if not parsed:
+            parsed = [("", ""), ("", "")]
+        rows = getattr(self, rows_attr)
+        while len(rows) > len(parsed):
+            row = rows.pop()
+            row.destroy()
+        for index, (name, url) in enumerate(parsed):
+            if index < len(rows):
+                self._fill_entry(rows[index]._name, name)
+                self._fill_entry(rows[index]._url, url)
             else:
-                self._add_src_row(box, rows_attr, name_ph, count, s.get("sheet") or s.get("name") or "", s.get("url") or "")
+                self._add_src_row(box, rows_attr, name_ph, count, name, url)
+        self._upd_src_count(rows_attr, count)
 
-    def _add_vd_type(self, value: str = "") -> None:
+    def _fill_entry(self, entry: tk.Entry, value: str) -> None:
+        current = entry.get()
+        if current == value:
+            return
+        entry.delete(0, "end")
+        if value:
+            entry.insert(0, value)
+
+    def _set_entry_rows(self, rows: list, add_fn, values, empty: int = 1) -> None:
+        cleaned = [str(item).strip() for item in (values or []) if str(item).strip()]
+        target = cleaned or ([""] * empty)
+        while len(rows) > len(target):
+            row = rows.pop()
+            row.destroy()
+        for index, value in enumerate(target):
+            if index < len(rows):
+                self._fill_entry(rows[index]._val, value)
+            else:
+                add_fn(value)
+
+    def _add_vd_type(self, value: str = "", in_total: bool = True, in_item: bool = True) -> None:
         row = tk.Frame(self.vd_type_box, bg=C["card"])
         row.pack(fill="x", pady=3)
         e = tk.Entry(row, font=MONO, relief="solid", bd=1)
         e.insert(0, value)
         e.pack(side="left", fill="x", expand=True, ipady=4)
+        checks = tk.Frame(row, bg=C["card"])
+        checks.pack(side="left", padx=(8, 0))
+        var_total = tk.BooleanVar(value=bool(in_total))
+        var_item = tk.BooleanVar(value=bool(in_item))
+        tk.Checkbutton(checks, text="总计数", variable=var_total, bg=C["card"], fg=C["ink"], activebackground=C["card"], selectcolor="#fff", font=FS).pack(side="left")
+        tk.Checkbutton(checks, text="逐条计数", variable=var_item, bg=C["card"], fg=C["ink"], activebackground=C["card"], selectcolor="#fff", font=FS).pack(side="left")
         StyleBtn(row, "ghost", text="删除", command=lambda: self._del_vd_type(row)).pack(side="left", padx=(6, 0))
         row._val = e
+        row._in_total = var_total
+        row._in_item = var_item
+        row._checks = checks
         e.bind("<KeyRelease>", lambda _e: self._upd_vd_type_count())
         self._vd_type_rows.append(row)
         self._upd_vd_type_count()
+        if getattr(self, "_vd_ui_mode", "") == "custom":
+            checks.pack_forget()
 
     def _del_vd_type(self, row) -> None:
         if row in self._vd_type_rows:
@@ -801,14 +977,20 @@ class DesktopApp(tk.Tk):
         n = sum(1 for r in self._vd_type_rows if r._val.get().strip())
         self.vd_type_count.configure(text=f"{n} 个分类")
 
-    def _read_vd_types(self) -> list[str]:
+    def _read_vd_types(self) -> list:
         out = []
         seen: set[str] = set()
         for r in self._vd_type_rows:
             t = r._val.get().strip()
             if t and t not in seen:
                 seen.add(t)
-                out.append(t)
+                out.append(
+                    {
+                        "name": t,
+                        "in_total": bool(r._in_total.get()) if hasattr(r, "_in_total") else True,
+                        "in_item": bool(r._in_item.get()) if hasattr(r, "_in_item") else True,
+                    }
+                )
         return out
 
     def _add_vd_report_cat(self, value: str = "") -> None:
@@ -847,15 +1029,8 @@ class DesktopApp(tk.Tk):
         return out
 
     def _set_vd_report_cats(self, items) -> None:
-        for r in list(self._vd_report_rows):
-            r.destroy()
-        self._vd_report_rows = []
-        items = [str(x).strip() for x in (items or []) if str(x).strip()]
-        if not items:
-            self._add_vd_report_cat()
-            return
-        for t in items:
-            self._add_vd_report_cat(t)
+        self._set_entry_rows(self._vd_report_rows, self._add_vd_report_cat, items, empty=1)
+        self._upd_vd_report_cat_count()
 
     def _add_vd_exclude(self, value: str = "") -> None:
         row = tk.Frame(self.vd_exclude_box, bg=C["card"])
@@ -893,15 +1068,8 @@ class DesktopApp(tk.Tk):
         return out
 
     def _set_vd_exclude_types(self, items) -> None:
-        for r in list(self._vd_exclude_rows):
-            r.destroy()
-        self._vd_exclude_rows = []
-        items = [str(x).strip() for x in (items or []) if str(x).strip()]
-        if not items:
-            self._add_vd_exclude()
-            return
-        for t in items:
-            self._add_vd_exclude(t)
+        self._set_entry_rows(self._vd_exclude_rows, self._add_vd_exclude, items, empty=1)
+        self._upd_vd_exclude_count()
 
     def _apply_vd_category_mode(self) -> None:
         other_only = "不统计" in (self.var_vd_category_mode.get() or "")
@@ -932,6 +1100,11 @@ class DesktopApp(tk.Tk):
                 self.vd_report_cat_wrap.pack_forget()
             if hasattr(self, "vd_wildcard_note"):
                 self.vd_wildcard_note.pack(anchor="w", pady=(0, 4))
+            if hasattr(self, "vd_type_head"):
+                self.vd_type_head.pack_forget()
+            for row in self._vd_type_rows:
+                if hasattr(row, "_checks"):
+                    row._checks.pack_forget()
             self._apply_vd_category_mode()
             self.vd_dest_note.configure(text="写入目标表：按制作人 × 日期 × 分类统计条数。不写日志、不提取时长、没有 30 秒算法。")
             self.vd_src_note.configure(text="读取源表的日期、制作人和类型，按下面的分类规则统计每天每个人每个分类有多少条。不读视频链接、不查时长。")
@@ -952,9 +1125,21 @@ class DesktopApp(tk.Tk):
                 self.vd_report_cat_wrap.pack(fill="x", pady=(8, 0))
             if hasattr(self, "vd_wildcard_note"):
                 self.vd_wildcard_note.pack_forget()
-            self.vd_type_note.configure(text="只跑类型列等于下面这些分类的视频（精确匹配，不用通配符）。会提取时长并写入日志表。")
+            if hasattr(self, "vd_type_head") and not self.vd_type_head.winfo_ismapped():
+                self.vd_type_head.pack(fill="x", pady=(0, 2), before=self.vd_type_box)
+            for row in self._vd_type_rows:
+                if hasattr(row, "_checks") and not row._checks.winfo_ismapped():
+                    delete_btn = next((child for child in row.winfo_children() if isinstance(child, tk.Button) and str(child.cget("text")) == "删除"), None)
+                    if delete_btn is not None:
+                        row._checks.pack(side="left", padx=(8, 0), before=delete_btn)
+                    else:
+                        row._checks.pack(side="left", padx=(8, 0))
+            self.vd_type_note.configure(
+                text="只跑这些分类（精确匹配）。都会提取时长写入日志。"
+                "勾选「总计数」才把该分类按时长计入总计数；勾选「逐条」才按时长规则计入逐条计数。都不勾则只进日志和额外分类列。"
+            )
             self.vd_dest_note.configure(
-                text="每人至少两列：总计数、逐条计数。第 4 节添加的分类会自动再加列（加 1 个分类就是 3 列）。也可在下面单独指定额外分类列。"
+                text="总计数 / 逐条计数只统计第 4 节勾选了对应项的分类。下面「额外分类列」一律按视频个数计，不按时长规则。"
             )
             self.vd_src_note.configure(
                 text="读取源表：A 列日期、B 列视频链接、H 列制作人（列字母可改）。B 列可以是蓝字文件名，程序会读取单元格里的超链接（Drive / YouTube），再写入另一张表的「日志表」和「数据表」。"
@@ -969,16 +1154,23 @@ class DesktopApp(tk.Tk):
             )
 
     def _set_vd_types(self, items) -> None:
-        for r in list(self._vd_type_rows):
-            r.destroy()
+        for row in list(self._vd_type_rows):
+            row.destroy()
         self._vd_type_rows = []
-        items = [str(x).strip() for x in (items or []) if str(x).strip()]
-        if not items:
+        cleaned = []
+        for item in items or []:
+            if isinstance(item, dict):
+                name = str(item.get("name") or "").strip()
+                if name:
+                    cleaned.append((name, bool(item.get("in_total", True)), bool(item.get("in_item", True))))
+            elif str(item).strip():
+                cleaned.append((str(item).strip(), True, True))
+        if not cleaned:
             self._add_vd_type()
             self._add_vd_type()
             return
-        for t in items:
-            self._add_vd_type(t)
+        for name, in_total, in_item in cleaned:
+            self._add_vd_type(name, in_total, in_item)
 
     def _add_vd_extra_col(self, field: str = "分类", column: str = "") -> None:
         row = tk.Frame(self.vd_extra_col_box, bg=C["card"])
@@ -1204,7 +1396,11 @@ class DesktopApp(tk.Tk):
 
     def _build_catalog(self, p) -> None:
         c1 = self._card(p, "1. 目录表", "遍历链接列和工作表名称列")
-        self._note(c1, "目录表默认 B 列是表格链接、D 列是要查找的工作表名称；两列都可以修改。")
+        self._note(
+            c1,
+            "目录表默认 B 列是表格链接、D 列是要查找的工作表名称；两列都可以修改。"
+            "B 列也支持本表内部链接，例如 =HYPERLINK(\"#gid=995133928\",\"1751-小源\")，会按 gid 汇总对应工作表。",
+        )
         self.var_catalog_index_url = tk.StringVar()
         self.var_catalog_index_sheet = tk.StringVar()
         self.var_catalog_start_row = tk.StringVar(value="2")
@@ -1219,6 +1415,27 @@ class DesktopApp(tk.Tk):
         self._cell(g2, 1, "工作表名称所在列", self.var_catalog_sheet_col)
         self.var_catalog_keep_header = tk.BooleanVar(value=False)
         self._check(c1, "每个工作表都保留首行（不勾选则只保留第一份表头）", self.var_catalog_keep_header)
+        self.var_catalog_add_source = tk.BooleanVar(value=True)
+        self._check(c1, "写入时在 A 列追加来源（用目录里的工作表名称，例如 1751-小源）", self.var_catalog_add_source)
+        self.var_catalog_skip_existing = tk.BooleanVar(value=True)
+        self._check(c1, "已有的行跳过，只追加新行（不整表重写）", self.var_catalog_skip_existing)
+        tk.Label(
+            c1,
+            text="排除这些工作表名称（不汇总。精确匹配；可用 * 通配符，例如 导航 或 1751*）",
+            bg=C["card"],
+            fg=C["muted"],
+            font=FS,
+            wraplength=760,
+            justify="left",
+        ).pack(anchor="w", pady=(8, 2))
+        self.catalog_exclude_box = tk.Frame(c1, bg=C["card"])
+        self.catalog_exclude_box.pack(fill="x")
+        ex_hint = tk.Frame(c1, bg=C["card"])
+        ex_hint.pack(fill="x", pady=4)
+        self.catalog_exclude_count = tk.Label(ex_hint, text="0 个排除", bg=C["card"], fg=C["muted"], font=FS)
+        self.catalog_exclude_count.pack(side="left")
+        StyleBtn(ex_hint, "ghost", text="+ 添加排除", command=self._add_catalog_exclude).pack(side="right")
+        self._add_catalog_exclude()
 
         c2 = self._card(p, "2. 写入目标表")
         self.var_catalog_target_url = tk.StringVar()
@@ -1230,11 +1447,28 @@ class DesktopApp(tk.Tk):
         self._cell(g, 1, "写入起始行", self.var_catalog_output_start_row)
         self._note(
             c2,
-            "只写入最后一列还有内容的范围，空列不写，整行为空的跳过。读一批写一批，每批 1000 行。"
-            "下次如果源表列变多，按本轮实际最大列数扩展。目录 B 列可以是蓝字超链接。",
+            "默认只追加还没有的行：目标表里已经有的跳过。一张表接近 1000 万格时，换一个新的目标表链接，"
+            "再用下面的日期筛选接着备份，就能把数据跑全。"
+            "勾选「追加来源」后，A 列写入目录里的工作表名称，原来的列整体右移。",
         )
 
-        c3 = self._card(p, "3. 定时汇总", "关掉窗口就不再跑")
+        c_date = self._card(p, "3. 日期筛选", "用来限制一张备份表的范围")
+        self._note(
+            c_date,
+            "只写入这个日期范围内的行。表满了就换目标表，把开始日期改成下一段再跑。"
+            "日期列填源表列字母；留空则从表头里找带「日期」的列。格式例如 2026-01-01。",
+        )
+        self.var_catalog_date_filter = tk.BooleanVar(value=True)
+        self._check(c_date, "启用日期筛选（不勾选则处理全部日期）", self.var_catalog_date_filter)
+        g = self._row3(c_date)
+        self.var_catalog_start = tk.StringVar()
+        self.var_catalog_end = tk.StringVar()
+        self.var_catalog_date_col = tk.StringVar()
+        self._cell(g, 0, "开始日期", self.var_catalog_start)
+        self._cell(g, 1, "结束日期", self.var_catalog_end)
+        self._cell(g, 2, "日期列", self.var_catalog_date_col)
+
+        c3 = self._card(p, "4. 定时汇总", "关掉窗口就不再跑")
         self._note(c3, "目录汇总也支持定时。可改成 1 小时、3 小时或自定义分钟。")
         g = self._row3(c3)
         self.var_catalog_minutes = tk.StringVar(value="180")
@@ -1243,6 +1477,45 @@ class DesktopApp(tk.Tk):
         self._check(c3, "启用目录汇总定时", self.var_catalog_sched)
         self.catalog_sched_info = tk.Label(c3, text="定时未启动", bg=C["card"], fg=C["muted"], font=FS)
         self.catalog_sched_info.pack(anchor="w", pady=4)
+
+    def _add_catalog_exclude(self, value: str = "") -> None:
+        row = tk.Frame(self.catalog_exclude_box, bg=C["card"])
+        row.pack(fill="x", pady=3)
+        e = tk.Entry(row, font=MONO, relief="solid", bd=1)
+        e.insert(0, value)
+        e.pack(side="left", fill="x", expand=True, ipady=4)
+        StyleBtn(row, "ghost", text="删除", command=lambda: self._del_catalog_exclude(row)).pack(side="left", padx=(6, 0))
+        row._val = e
+        e.bind("<KeyRelease>", lambda _e: self._upd_catalog_exclude_count())
+        self._catalog_exclude_rows.append(row)
+        self._upd_catalog_exclude_count()
+
+    def _del_catalog_exclude(self, row) -> None:
+        if row in self._catalog_exclude_rows:
+            self._catalog_exclude_rows.remove(row)
+        row.destroy()
+        if not self._catalog_exclude_rows:
+            self._add_catalog_exclude()
+        self._upd_catalog_exclude_count()
+
+    def _upd_catalog_exclude_count(self) -> None:
+        n = sum(1 for r in self._catalog_exclude_rows if r._val.get().strip())
+        if hasattr(self, "catalog_exclude_count"):
+            self.catalog_exclude_count.configure(text=f"{n} 个排除")
+
+    def _read_catalog_exclude(self) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for row in self._catalog_exclude_rows:
+            text = row._val.get().strip()
+            if text and text not in seen:
+                seen.add(text)
+                out.append(text)
+        return out
+
+    def _set_catalog_exclude(self, items) -> None:
+        self._set_entry_rows(self._catalog_exclude_rows, self._add_catalog_exclude, items, empty=1)
+        self._upd_catalog_exclude_count()
 
     def _build_align(self, p) -> None:
         c1 = self._card(p, "1. 数据源表格链接", collapsed=True)
@@ -1374,6 +1647,12 @@ class DesktopApp(tk.Tk):
             justify="left",
         )
         self.vd_type_note.pack(anchor="w", pady=(0, 6))
+        self.vd_type_head = tk.Frame(c_type, bg="#ecfdf5")
+        self.vd_type_head.pack(fill="x", pady=(0, 2))
+        tk.Label(self.vd_type_head, text="分类名称", bg="#ecfdf5", fg=C["muted"], font=FS, anchor="w").pack(side="left", fill="x", expand=True, padx=6, pady=3)
+        tk.Label(self.vd_type_head, text="计入总计数", bg="#ecfdf5", fg=C["muted"], font=FS, width=12).pack(side="left")
+        tk.Label(self.vd_type_head, text="计入逐条计数", bg="#ecfdf5", fg=C["muted"], font=FS, width=12).pack(side="left")
+        tk.Label(self.vd_type_head, text="", bg="#ecfdf5", width=8).pack(side="left")
         self.vd_type_box = tk.Frame(c_type, bg=C["card"])
         self.vd_type_box.pack(fill="x")
         self.vd_video_filter_row = tk.Frame(c_type, bg=C["card"])
@@ -1485,7 +1764,7 @@ class DesktopApp(tk.Tk):
         self.vd_report_cat_wrap.pack(fill="x", pady=(8, 0))
         tk.Label(
             self.vd_report_cat_wrap,
-            text="数据表额外分类列（可留空：会按第 4 节添加的分类自动建列，总计数 + 逐条 + 每个分类。视频按精确分类名匹配）",
+            text="数据表额外分类列：按视频个数计（5 条就是 5，不按时长规则）。可留空则按第 4 节分类自动建列。",
             bg=C["card"],
             fg=C["muted"],
             font=FS,
@@ -1664,6 +1943,7 @@ class DesktopApp(tk.Tk):
     def _refresh_sa_display(self) -> None:
         files = [str(p).strip() for p in (self._cred_files or []) if str(p).strip()]
         self._cred_files = files
+        self._sa_files_shown = list(files)
         self.var_credentials.set(files[0] if files else "")
         emails: list[str] = []
         for path in files:
@@ -1868,6 +2148,289 @@ class DesktopApp(tk.Tk):
         mappings = self._align_default_mappings if key == "__default__" else self._align_profiles.get(key, self._align_default_mappings)
         self._write_align_mappings(mappings)
 
+    def _set_str(self, var: tk.StringVar, value, default: str = "") -> None:
+        text = "" if value is None else str(value)
+        if text == "" and default:
+            text = default
+        if var.get() != text:
+            var.set(text)
+
+    def _set_bool(self, var: tk.BooleanVar, value, default: bool = False) -> None:
+        flag = default if value is None else bool(value)
+        if var.get() != flag:
+            var.set(flag)
+
+    def _settings_slice(self, template: str) -> dict:
+        creds = list(self._cred_files or ([self.var_credentials.get().strip()] if self.var_credentials.get().strip() else []))
+        shared = {
+            "credentials_file": (creds[0] if creds else self.var_credentials.get().strip()),
+            "credentials_files": creds,
+        }
+        if template == "catalog":
+            return {
+                **shared,
+                "catalog_index_url": self.var_catalog_index_url.get().strip(),
+                "catalog_index_sheet": self.var_catalog_index_sheet.get().strip(),
+                "catalog_start_row": self.var_catalog_start_row.get().strip(),
+                "catalog_url_col": self.var_catalog_url_col.get().strip(),
+                "catalog_sheet_col": self.var_catalog_sheet_col.get().strip(),
+                "catalog_target_url": self.var_catalog_target_url.get().strip(),
+                "catalog_output_sheet": self.var_catalog_output_sheet.get().strip(),
+                "catalog_output_start_row": self.var_catalog_output_start_row.get().strip(),
+                "catalog_keep_each_header": self.var_catalog_keep_header.get(),
+                "catalog_add_source": self.var_catalog_add_source.get(),
+                "catalog_skip_existing": self.var_catalog_skip_existing.get(),
+                "catalog_date_filter_enabled": self.var_catalog_date_filter.get(),
+                "catalog_date_col": self.var_catalog_date_col.get().strip(),
+                "catalog_start_date": self.var_catalog_start.get().strip(),
+                "catalog_end_date": self.var_catalog_end.get().strip(),
+                "catalog_exclude_sheets": self._read_catalog_exclude(),
+                "catalog_schedule_enabled": self.var_catalog_sched.get(),
+                "catalog_schedule_minutes": self.var_catalog_minutes.get().strip(),
+            }
+        if template == "align":
+            self._save_align_profile()
+            return {
+                **shared,
+                "align_target_url": self.var_align_target_url.get().strip(),
+                "align_output_sheet": self.var_align_output_sheet.get().strip(),
+                "align_start_row": self.var_align_start_row.get().strip(),
+                "align_source_sheet": self.var_align_source_sheet.get().strip(),
+                "align_header_row": self.var_align_header_row.get().strip(),
+                "align_schedule_minutes": self.var_align_minutes.get().strip(),
+                "align_include_headers": self.var_align_include_headers.get(),
+                "align_schedule_enabled": self.var_align_sched.get(),
+                "align_schedule_only_if_changed": self.var_align_changed.get(),
+                "align_sources": self._read_src("_align_rows", align=True),
+                "align_headers": [item["target"] for item in self._align_default_mappings],
+                "align_mappings": self._align_default_mappings,
+                "align_mapping_profiles": self._align_profiles,
+            }
+        if template in ("video", "custom"):
+            return {
+                **shared,
+                "vd_source_url": self.var_vd_source_url.get().strip(),
+                "vd_source_sheet": self.var_vd_source_sheet.get().strip(),
+                "vd_start_row": self.var_vd_start_row.get().strip(),
+                "vd_col_date": self.var_vd_col_date.get().strip(),
+                "vd_col_link": self.var_vd_col_link.get().strip(),
+                "vd_col_name": self.var_vd_col_name.get().strip(),
+                "vd_col_type": self.var_vd_col_type.get().strip(),
+                "vd_types": self._read_vd_types(),
+                "vd_report_categories": self._read_vd_report_cats(),
+                "vd_dest_url": self.var_vd_dest_url.get().strip(),
+                "vd_log_sheet": self.var_vd_log_sheet.get().strip(),
+                "vd_report_sheet": self.var_vd_report_sheet.get().strip(),
+                "vd_out_start_row": self.var_vd_out_start_row.get().strip(),
+                "vd_unit_seconds": self.var_vd_unit.get().strip(),
+                "vd_count_mode": (
+                    "per_video_ceil"
+                    if self.var_vd_count_mode.get() == "逐条视频按30秒计数"
+                    else "divide_total"
+                ),
+                "vd_include_headers": self.var_vd_include_headers.get(),
+                "vd_schedule_enabled": self.var_vd_schedule_enabled.get(),
+                "vd_schedule_minutes": self.var_vd_schedule_minutes.get().strip(),
+                "vd_start_date": self.var_vd_start.get().strip(),
+                "vd_end_date": self.var_vd_end.get().strip(),
+                "vd_source_sheets": [value.strip() for value in self.var_vd_source_sheet.get().replace("，", ",").split(",") if value.strip()],
+                "vd_date_filter_enabled": self.var_vd_date_filter_enabled.get(),
+                "vd_type_filter_mode": {"只包含这些类型": "include", "排除这些类型": "exclude", "不筛选类型": "all"}.get(self.var_vd_type_filter_mode.get(), "include"),
+                "vd_write_log": template == "video",
+                "vd_other_category": self.var_vd_other_category.get().strip(),
+                "vd_exclude_types": self._read_vd_exclude_types(),
+                "vd_category_mode": (
+                    "other_only"
+                    if "不统计" in (self.var_vd_category_mode.get() or "")
+                    else "columns_plus_other"
+                ),
+                "vd_empty_to_other": self.var_vd_empty_to_other.get(),
+                "vd_columns": self._read_vd_columns(),
+            }
+        if template == "roster":
+            return {
+                **shared,
+                "roster_config_url": self.var_roster_config_url.get().strip(),
+                "roster_config_sheet": self.var_roster_config_sheet.get().strip(),
+                "roster_start_row": self.var_roster_start_row.get().strip(),
+                "roster_target_url": self.var_roster_target_url.get().strip(),
+                "roster_traffic_sheet": self.var_roster_traffic_sheet.get().strip(),
+                "roster_date_start_row": self.var_roster_date_start.get().strip(),
+                "roster_columns": self._read_roster_columns(),
+            }
+        return {
+            **shared,
+            "target_url": self.var_target_url.get().strip(),
+            "hot_target_url": self.var_hot_target_url.get().strip(),
+            "output_sheet": self.var_output_sheet.get().strip(),
+            "hot_output_sheet": self.var_hot_output_sheet.get().strip(),
+            "output_start_row": self.var_output_start_row.get().strip(),
+            "hot_start_row": self.var_hot_start_row.get().strip(),
+            "start_date": self.var_start.get().strip(),
+            "end_date": self.var_end.get().strip(),
+            "likes_threshold": self.var_likes.get().strip(),
+            "schedule_minutes": self.var_minutes.get().strip(),
+            "exclude_id_value": self.var_exclude.get().strip(),
+            "date_field": self.var_date_field.get().strip(),
+            "sort_field": self.var_sort_field.get().strip(),
+            "cf_publish_url": self.var_cf_url.get().strip(),
+            "cf_publish_secret": self.var_cf_secret.get().strip(),
+            "cf_publish_source": self.var_cf_source.get().strip() or "all",
+            "include_headers": self.var_include_headers.get(),
+            "hot_include_headers": self.var_hot_include_headers.get(),
+            "add_source_column": self.var_add_source_column.get(),
+            "sort_descending": self.var_sort_desc.get(),
+            "write_all": self.var_write_all.get(),
+            "write_hot": self.var_write_hot.get(),
+            "upsert_by_id": self.var_upsert.get(),
+            "schedule_enabled": self.var_sched.get(),
+            "schedule_only_if_changed": self.var_changed.get(),
+            "cf_publish_after_sync": self.var_cf_after.get(),
+            "sources": self._read_src("_src_rows"),
+            "fields": self._read_fields(),
+        }
+
+    def _apply_settings_slice(self, settings: dict, template: str) -> None:
+        s = settings or {}
+        if template == "catalog":
+            self._set_str(self.var_catalog_index_url, s.get("catalog_index_url"))
+            self._set_str(self.var_catalog_index_sheet, s.get("catalog_index_sheet"))
+            self._set_str(self.var_catalog_start_row, s.get("catalog_start_row"), "2")
+            self._set_str(self.var_catalog_url_col, s.get("catalog_url_col"), "B")
+            self._set_str(self.var_catalog_sheet_col, s.get("catalog_sheet_col"), "D")
+            self._set_str(self.var_catalog_target_url, s.get("catalog_target_url"))
+            self._set_str(self.var_catalog_output_sheet, s.get("catalog_output_sheet"), "目录汇总")
+            self._set_str(self.var_catalog_output_start_row, s.get("catalog_output_start_row"), "1")
+            self._set_bool(self.var_catalog_keep_header, s.get("catalog_keep_each_header"))
+            self._set_bool(self.var_catalog_add_source, s.get("catalog_add_source"), True)
+            self._set_bool(self.var_catalog_skip_existing, s.get("catalog_skip_existing"), True)
+            self._set_bool(self.var_catalog_date_filter, s.get("catalog_date_filter_enabled"), True)
+            self._set_str(self.var_catalog_date_col, s.get("catalog_date_col"))
+            self._set_str(self.var_catalog_start, s.get("catalog_start_date"))
+            self._set_str(self.var_catalog_end, s.get("catalog_end_date"))
+            self._set_bool(self.var_catalog_sched, s.get("catalog_schedule_enabled"))
+            self._set_str(self.var_catalog_minutes, s.get("catalog_schedule_minutes"), "180")
+            self._set_catalog_exclude(s.get("catalog_exclude_sheets") or [])
+            return
+        if template == "align":
+            self._set_str(self.var_align_source_sheet, s.get("align_source_sheet"))
+            self._set_str(self.var_align_header_row, s.get("align_header_row"), "1")
+            self._set_str(self.var_align_target_url, s.get("align_target_url"))
+            self._set_str(self.var_align_output_sheet, s.get("align_output_sheet"), "对齐结果")
+            self._set_str(self.var_align_start_row, s.get("align_start_row"), "1")
+            self._set_bool(self.var_align_include_headers, s.get("align_include_headers"), True)
+            self._set_str(self.var_align_minutes, s.get("align_schedule_minutes"), "60")
+            self._set_bool(self.var_align_sched, s.get("align_schedule_enabled"))
+            self._set_bool(self.var_align_changed, s.get("align_schedule_only_if_changed"), True)
+            self._set_src(self.align_box, "_align_rows", "例如：8月份", self.align_count, s.get("align_sources"), align=True)
+            mappings = s.get("align_mappings") or [{"target": header, "source": header} for header in (s.get("align_headers") or [])]
+            self._align_default_mappings = copy.deepcopy(mappings)
+            self._align_profiles = copy.deepcopy(s.get("align_mapping_profiles") or {})
+            self._align_profile_key = "__default__"
+            self._write_align_mappings(self._align_default_mappings)
+            self._refresh_align_profiles()
+            return
+        if template in ("video", "custom"):
+            self._set_str(self.var_vd_source_url, s.get("vd_source_url"))
+            source_sheets = s.get("vd_source_sheets") or []
+            self._set_str(
+                self.var_vd_source_sheet,
+                ", ".join(source_sheets) if source_sheets else (s.get("vd_source_sheet") or ""),
+            )
+            self._set_str(self.var_vd_start_row, s.get("vd_start_row"), "2")
+            self._set_str(self.var_vd_col_date, s.get("vd_col_date"), "A")
+            self._set_str(self.var_vd_col_link, s.get("vd_col_link"), "B")
+            self._set_str(self.var_vd_col_name, s.get("vd_col_name"), "H")
+            self._set_str(self.var_vd_col_type, s.get("vd_col_type"), "E")
+            self._set_vd_types(s.get("vd_types") or [])
+            self._set_vd_report_cats(s.get("vd_report_categories") or [])
+            self._set_str(self.var_vd_dest_url, s.get("vd_dest_url"))
+            self._set_str(self.var_vd_log_sheet, s.get("vd_log_sheet"), "日志表")
+            self._set_str(self.var_vd_report_sheet, s.get("vd_report_sheet"), "数据表")
+            self._set_str(self.var_vd_out_start_row, s.get("vd_out_start_row"), "1")
+            self._set_str(self.var_vd_unit, s.get("vd_unit_seconds"), "30")
+            self.var_vd_count_mode.set(
+                "逐条视频按30秒计数" if s.get("vd_count_mode") == "per_video_ceil" else "汇总总秒数 ÷ 30"
+            )
+            self._set_bool(self.var_vd_include_headers, s.get("vd_include_headers"), True)
+            self._set_str(self.var_vd_start, s.get("vd_start_date"))
+            self._set_str(self.var_vd_end, s.get("vd_end_date"))
+            self._set_bool(self.var_vd_schedule_enabled, s.get("vd_schedule_enabled"))
+            self._set_str(self.var_vd_schedule_minutes, s.get("vd_schedule_minutes"), "180")
+            self._set_bool(self.var_vd_date_filter_enabled, s.get("vd_date_filter_enabled"), True)
+            self.var_vd_type_filter_mode.set(
+                {"include": "只包含这些类型", "exclude": "排除这些类型", "all": "不筛选类型"}.get(s.get("vd_type_filter_mode") or "include", "只包含这些类型")
+            )
+            self._set_str(self.var_vd_other_category, s.get("vd_other_category"))
+            exclude = list(s.get("vd_exclude_types") or [])
+            type_names = {
+                str(item.get("name") if isinstance(item, dict) else item).strip()
+                for item in (s.get("vd_types") or [])
+                if str(item.get("name") if isinstance(item, dict) else item).strip()
+            }
+            if type_names and exclude and type_names == {str(x).strip() for x in exclude}:
+                exclude = []
+            self._set_vd_exclude_types(exclude)
+            self.var_vd_category_mode.set(
+                "这些分类不统计，未分类和其他全部归入其余"
+                if s.get("vd_category_mode") == "other_only"
+                else "分类单独成列，未分类和其他归入其余"
+            )
+            self._set_bool(self.var_vd_empty_to_other, s.get("vd_empty_to_other"), True)
+            if template == "custom" and hasattr(self, "vd_category_mode_combo"):
+                self._apply_vd_category_mode()
+            self._set_vd_columns(s.get("vd_columns") or [])
+            return
+        if template == "roster":
+            self._set_str(self.var_roster_config_url, s.get("roster_config_url"))
+            self._set_str(self.var_roster_config_sheet, s.get("roster_config_sheet"))
+            self._set_str(self.var_roster_start_row, s.get("roster_start_row"), "2")
+            self._set_str(self.var_roster_target_url, s.get("roster_target_url"))
+            self._set_str(self.var_roster_traffic_sheet, s.get("roster_traffic_sheet"), "引流")
+            self._set_str(self.var_roster_date_start, s.get("roster_date_start_row"), "24")
+            self._set_roster_columns(s.get("roster_columns") or [])
+            return
+        self._set_str(self.var_start, s.get("start_date"))
+        self._set_str(self.var_end, s.get("end_date"))
+        self._set_str(self.var_likes, s.get("likes_threshold"), "1000")
+        self._set_bool(self.var_add_source_column, s.get("add_source_column"), True)
+        self._set_bool(self.var_upsert, s.get("upsert_by_id"), True)
+        self._set_bool(self.var_write_all, s.get("write_all"), True)
+        self._set_bool(self.var_write_hot, s.get("write_hot"))
+        self._set_str(self.var_target_url, s.get("target_url"))
+        self._set_str(self.var_output_sheet, s.get("output_sheet"), "筛选结果")
+        self._set_str(self.var_output_start_row, s.get("output_start_row"), "1")
+        self._set_bool(self.var_include_headers, s.get("include_headers"))
+        self._set_str(self.var_hot_target_url, s.get("hot_target_url"))
+        self._set_str(self.var_hot_output_sheet, s.get("hot_output_sheet"), "点赞1000以上")
+        self._set_str(self.var_hot_start_row, s.get("hot_start_row"), "1")
+        self._set_bool(self.var_hot_include_headers, s.get("hot_include_headers"), True)
+        self._set_str(self.var_cf_url, s.get("cf_publish_url"))
+        self._set_str(self.var_cf_secret, s.get("cf_publish_secret"))
+        self._set_str(self.var_cf_source, s.get("cf_publish_source"), "all")
+        self._set_bool(self.var_cf_after, s.get("cf_publish_after_sync"), True)
+        self._set_str(self.var_minutes, s.get("schedule_minutes"), "1440")
+        self._set_bool(self.var_sched, s.get("schedule_enabled"))
+        self._set_bool(self.var_changed, s.get("schedule_only_if_changed"), True)
+        self._set_str(self.var_exclude, s.get("exclude_id_value"), "未找到")
+        self._set_str(self.var_date_field, s.get("date_field"), "发布日期")
+        self._set_str(self.var_sort_field, s.get("sort_field"), "点赞")
+        self._set_bool(self.var_sort_desc, s.get("sort_descending"), True)
+        self._set_src(self.src_box, "_src_rows", "例如：管理组", self.src_count, s.get("sources") or s.get("source_urls"))
+        wanted = s.get("fields") or copy_default_fields()
+        if len(self._field_rows) != len(wanted):
+            for row in list(self._field_rows):
+                row.destroy()
+            self._field_rows = []
+            for field in wanted:
+                self._add_field(field)
+        else:
+            for row, field in zip(self._field_rows, wanted):
+                if isinstance(field, dict):
+                    self._fill_entry(row._name, str(field.get("name") or ""))
+                    self._fill_entry(row._sheet, str(field.get("sheet") or ""))
+                    self._fill_entry(row._range, str(field.get("range") or ""))
+
     def _payload(self) -> dict:
         self._save_align_profile()
         return {
@@ -1904,6 +2467,13 @@ class DesktopApp(tk.Tk):
             "catalog_output_sheet": self.var_catalog_output_sheet.get().strip(),
             "catalog_output_start_row": self.var_catalog_output_start_row.get().strip(),
             "catalog_keep_each_header": self.var_catalog_keep_header.get(),
+            "catalog_add_source": self.var_catalog_add_source.get(),
+            "catalog_skip_existing": self.var_catalog_skip_existing.get(),
+            "catalog_date_filter_enabled": self.var_catalog_date_filter.get(),
+            "catalog_date_col": self.var_catalog_date_col.get().strip(),
+            "catalog_start_date": self.var_catalog_start.get().strip(),
+            "catalog_end_date": self.var_catalog_end.get().strip(),
+            "catalog_exclude_sheets": self._read_catalog_exclude(),
             "catalog_schedule_enabled": self.var_catalog_sched.get(),
             "catalog_schedule_minutes": self.var_catalog_minutes.get().strip(),
             "include_headers": self.var_include_headers.get(),
@@ -1971,7 +2541,7 @@ class DesktopApp(tk.Tk):
             "align_mapping_profiles": self._align_profiles,
         }
 
-    def _load_cfg(self, cfg) -> None:
+    def _load_cfg(self, cfg, template: str | None = None) -> None:
         self.var_start.set(cfg.start_date or "")
         self.var_end.set(cfg.end_date or "")
         self.var_likes.set(str(cfg.likes_threshold or 1000))
@@ -1999,7 +2569,8 @@ class DesktopApp(tk.Tk):
             creds.insert(0, cfg.credentials_file)
         self._cred_files = creds
         self.var_credentials.set(creds[0] if creds else "")
-        self._refresh_sa_display()
+        if creds != self._sa_files_shown:
+            self._refresh_sa_display()
         self.var_exclude.set(cfg.exclude_id_value or "未找到")
         self.var_date_field.set(cfg.date_field or "发布日期")
         self.var_sort_field.set(cfg.sort_field or "点赞")
@@ -2022,6 +2593,14 @@ class DesktopApp(tk.Tk):
         self.var_catalog_output_sheet.set(getattr(cfg, "catalog_output_sheet", "目录汇总") or "目录汇总")
         self.var_catalog_output_start_row.set(str(getattr(cfg, "catalog_output_start_row", 1) or 1))
         self.var_catalog_keep_header.set(bool(getattr(cfg, "catalog_keep_each_header", False)))
+        self.var_catalog_add_source.set(bool(getattr(cfg, "catalog_add_source", True)))
+        self.var_catalog_skip_existing.set(bool(getattr(cfg, "catalog_skip_existing", True)))
+        self.var_catalog_date_filter.set(bool(getattr(cfg, "catalog_date_filter_enabled", True)))
+        self.var_catalog_date_col.set(getattr(cfg, "catalog_date_col", "") or "")
+        self.var_catalog_start.set(getattr(cfg, "catalog_start_date", "") or "")
+        self.var_catalog_end.set(getattr(cfg, "catalog_end_date", "") or "")
+        if template in (None, "", "catalog"):
+            self._set_catalog_exclude(getattr(cfg, "catalog_exclude_sheets", None) or [])
         self.var_catalog_sched.set(bool(getattr(cfg, "catalog_schedule_enabled", False)))
         self.var_catalog_minutes.set(str(getattr(cfg, "catalog_schedule_minutes", 180) or 180))
         self.var_vd_source_url.set(getattr(cfg, "vd_source_url", "") or "")
@@ -2032,8 +2611,9 @@ class DesktopApp(tk.Tk):
         self.var_vd_col_link.set(getattr(cfg, "vd_col_link", "B") or "B")
         self.var_vd_col_name.set(getattr(cfg, "vd_col_name", "H") or "H")
         self.var_vd_col_type.set(getattr(cfg, "vd_col_type", "E") or "E")
-        self._set_vd_types(getattr(cfg, "vd_types", None) or [])
-        self._set_vd_report_cats(getattr(cfg, "vd_report_categories", None) or [])
+        if template in (None, "", "video", "custom"):
+            self._set_vd_types(getattr(cfg, "vd_types", None) or [])
+            self._set_vd_report_cats(getattr(cfg, "vd_report_categories", None) or [])
         self.var_vd_dest_url.set(getattr(cfg, "vd_dest_url", "") or "")
         self.var_vd_log_sheet.set(getattr(cfg, "vd_log_sheet", "日志表") or "日志表")
         self.var_vd_report_sheet.set(getattr(cfg, "vd_report_sheet", "数据表") or "数据表")
@@ -2058,91 +2638,88 @@ class DesktopApp(tk.Tk):
         self.var_roster_target_url.set(getattr(cfg, "roster_target_url", "") or "")
         self.var_roster_traffic_sheet.set(getattr(cfg, "roster_traffic_sheet", "引流") or "引流")
         self.var_roster_date_start.set(str(getattr(cfg, "roster_date_start_row", 24) or 24))
-        self._set_roster_columns(getattr(cfg, "roster_columns", None) or [])
+        if template in (None, "", "roster"):
+            self._set_roster_columns(getattr(cfg, "roster_columns", None) or [])
         exclude = list(getattr(cfg, "vd_exclude_types", None) or [])
-        types = list(getattr(cfg, "vd_types", None) or [])
-        if types and exclude and {str(x).strip() for x in types} == {str(x).strip() for x in exclude}:
+        type_names = {
+            str(item.get("name") if isinstance(item, dict) else item).strip()
+            for item in (getattr(cfg, "vd_types", None) or [])
+            if str(item.get("name") if isinstance(item, dict) else item).strip()
+        }
+        if type_names and exclude and type_names == {str(x).strip() for x in exclude}:
             exclude = []
-        self._set_vd_exclude_types(exclude)
+        if template in (None, "", "video", "custom"):
+            self._set_vd_exclude_types(exclude)
         self.var_vd_category_mode.set(
             "这些分类不统计，未分类和其他全部归入其余"
             if getattr(cfg, "vd_category_mode", "columns_plus_other") == "other_only"
             else "分类单独成列，未分类和其他归入其余"
         )
         self.var_vd_empty_to_other.set(bool(getattr(cfg, "vd_empty_to_other", True)))
-        if hasattr(self, "vd_category_mode_combo"):
+        if hasattr(self, "vd_category_mode_combo") and template in (None, "", "custom"):
             self._apply_vd_category_mode()
-        self._set_vd_columns(getattr(cfg, "vd_columns", None) or [])
-        self._set_src(self.src_box, "_src_rows", "例如：管理组", self.src_count, cfg.sources or cfg.source_urls)
-        self._set_src(self.align_box, "_align_rows", "例如：8月份", self.align_count, cfg.align_sources, align=True)
-        for r in list(self._field_rows):
-            r.destroy()
-        self._field_rows = []
-        for f in cfg.fields or copy_default_fields():
-            self._add_field(f)
-        mappings = getattr(cfg, "align_mappings", None) or [
-            {"target": header, "source": header} for header in (cfg.align_headers or [])
-        ]
-        self._align_default_mappings = copy.deepcopy(mappings)
-        self._align_profiles = copy.deepcopy(getattr(cfg, "align_mapping_profiles", None) or {})
-        self._align_profile_key = "__default__"
-        self._write_align_mappings(self._align_default_mappings)
-        self._refresh_align_profiles()
+        if template in (None, "", "video", "custom"):
+            self._set_vd_columns(getattr(cfg, "vd_columns", None) or [])
+        if template in (None, "", "filter"):
+            self._set_src(self.src_box, "_src_rows", "例如：管理组", self.src_count, cfg.sources or cfg.source_urls)
+            for r in list(self._field_rows):
+                r.destroy()
+            self._field_rows = []
+            for f in cfg.fields or copy_default_fields():
+                self._add_field(f)
+        if template in (None, "", "align"):
+            self._set_src(self.align_box, "_align_rows", "例如：8月份", self.align_count, cfg.align_sources, align=True)
+            mappings = getattr(cfg, "align_mappings", None) or [
+                {"target": header, "source": header} for header in (cfg.align_headers or [])
+            ]
+            self._align_default_mappings = copy.deepcopy(mappings)
+            self._align_profiles = copy.deepcopy(getattr(cfg, "align_mapping_profiles", None) or {})
+            self._align_profile_key = "__default__"
+            self._write_align_mappings(self._align_default_mappings)
+            self._refresh_align_profiles()
 
     def _save(self, quiet: bool = False) -> None:
+        self._store_current_menu_settings()
         cfg = self._cfg_for_action()
-        payload = self._payload()
         current = next((item for item in self._menus if item["id"] == self._active_menu_id), None)
-        if current:
-            current["settings"] = copy.deepcopy(payload)
-        cfg.ui_menus = copy.deepcopy(self._menus)
-        cfg.ui_active_menu = self._active_menu_id
         save_config(cfg)
         self.cfg = cfg
-        if cfg.schedule_enabled:
-            start_scheduler(cfg.schedule_minutes, cfg.schedule_only_if_changed)
-        else:
-            stop_scheduler()
-        if cfg.align_schedule_enabled:
-            start_align_scheduler(cfg.align_schedule_minutes, cfg.align_schedule_only_if_changed)
-        else:
-            stop_align_scheduler()
-        if cfg.vd_schedule_enabled:
-            if not cfg.vd_source_url or not cfg.vd_dest_url:
+        current_template = current.get("template") if current else ""
+        if current_template in ("video", "custom") and self.var_vd_schedule_enabled.get():
+            if not self.var_vd_source_url.get().strip() or not self.var_vd_dest_url.get().strip():
                 self.var_vd_schedule_enabled.set(False)
+                current["settings"]["vd_schedule_enabled"] = False
                 cfg.vd_schedule_enabled = False
                 save_config(cfg)
-                stop_video_scheduler()
                 if not quiet:
-                    messagebox.showwarning("数据汇总工具", "视频时长定时需要先填写源表和目标表链接")
-            else:
-                start_video_scheduler(cfg.vd_schedule_minutes)
-        else:
-            stop_video_scheduler()
-        if getattr(cfg, "catalog_schedule_enabled", False):
-            if not cfg.catalog_index_url or not cfg.catalog_target_url:
+                    messagebox.showwarning("数据汇总工具", "视频/分类定时需要先填写源表和目标表链接")
+        if current_template == "catalog" and self.var_catalog_sched.get():
+            if not self.var_catalog_index_url.get().strip() or not self.var_catalog_target_url.get().strip():
                 self.var_catalog_sched.set(False)
+                current["settings"]["catalog_schedule_enabled"] = False
                 cfg.catalog_schedule_enabled = False
                 save_config(cfg)
-                stop_catalog_scheduler()
                 if not quiet:
                     messagebox.showwarning("数据汇总工具", "目录汇总定时需要先填写目录表和目标表链接")
-            else:
-                start_catalog_scheduler(cfg.catalog_schedule_minutes)
-        else:
-            stop_catalog_scheduler()
+        self._sync_schedulers()
         if not quiet:
-            self._append_log("已保存配置")
+            self._append_log("已保存配置，各菜单的定时会按各自间隔执行")
+
+    def _sync_schedulers(self) -> None:
+        self._store_current_menu_settings()
+        sync_schedulers_from_menus(self._menus)
 
     def _cfg_for_action(self):
         """Build a complete config while retaining the editable menu definitions."""
-        payload = self._payload()
+        self._store_current_menu_settings()
         current = next((item for item in self._menus if item["id"] == self._active_menu_id), None)
-        if current:
-            current["settings"] = copy.deepcopy(payload)
-        cfg = _cfg_from_payload(payload)
+        settings = (current or {}).get("settings") or {}
+        cfg = _cfg_from_payload(settings, base=Config())
         cfg.ui_menus = copy.deepcopy(self._menus)
         cfg.ui_active_menu = self._active_menu_id
+        if self._cred_files:
+            cfg.credentials_files = list(self._cred_files)
+            cfg.credentials_file = self._cred_files[0]
         return cfg
 
     def _run_now(self) -> None:
@@ -2222,16 +2799,14 @@ class DesktopApp(tk.Tk):
             "roster": start_roster_job,
         }
         queued = 0
+        self._store_current_menu_settings()
         for item in self._menus:
             if not self._menu_checks.get(item["id"], tk.BooleanVar(value=False)).get():
                 continue
-            settings = copy.deepcopy(item.get("settings") or {})
-            if item["id"] == self._active_menu_id:
-                settings = copy.deepcopy(self._payload())
-                item["settings"] = settings
-            cfg = _cfg_from_payload(settings)
+            settings = item.get("settings") or {}
+            cfg = _cfg_from_payload(settings, base=Config())
             cfg.ui_active_menu = item["id"]
-            cfg.ui_menus = copy.deepcopy(self._menus)
+            cfg.ui_menus = self._menus
             fn = starters.get(item["template"])
             if not fn:
                 continue
@@ -2275,6 +2850,34 @@ class DesktopApp(tk.Tk):
         self._write_align_mappings(mappings)
         self._save_align_profile()
         self._append_log(f"读到 {len(headers or [])} 个表头")
+
+    def _job_done_status(self, job: dict) -> str:
+        result = job.get("result") or {}
+        finished = job.get("finished_at") or ""
+        prefix = f"已完成 {finished}  " if finished else "已完成  "
+        mode = result.get("mode")
+        if mode == "catalog":
+            added = int(result.get("total_rows") or 0)
+            existing = int(result.get("existing_rows") or 0)
+            total = int(result.get("sheet_total") or (existing + added))
+            parts = [f"本轮新增 {added} 行", f"目标表一共 {total} 行"]
+            skipped = int(result.get("skipped") or 0)
+            date_skip = int(result.get("date_skipped") or 0)
+            ok_sheets = int(result.get("ok_sheets") or 0)
+            if skipped:
+                parts.append(f"重复跳过 {skipped}")
+            if date_skip:
+                parts.append(f"日期外 {date_skip}")
+            if ok_sheets:
+                parts.append(f"成功 {ok_sheets} 个工作表")
+            return prefix + "，".join(parts)
+        if mode in ("video", "video_custom"):
+            return prefix + f"{result.get('people') or 0} 人 · 本次 {result.get('appended') or 0} 条"
+        if result.get("skipped") and not result.get("total_rows"):
+            return prefix + "内容未变化，已跳过"
+        if "total_rows" in result:
+            return prefix + f"写入 {result.get('total_rows') or 0} 行"
+        return prefix.strip()
 
     def _set_badge(self, text, bg):
         if not self._alive:
@@ -2329,11 +2932,20 @@ class DesktopApp(tk.Tk):
                 self.log.configure(state="disabled")
             running = bool(job.get("running"))
             queued = bool(job.get("queued"))
+            mine = menu_schedule_snapshot(self._active_menu_id or "")
             snap = _schedule_snapshot()
             asnap = _align_schedule_snapshot()
             vsnap = _video_schedule_snapshot()
             csnap = _catalog_schedule_snapshot()
-            nxt = snap.get("next_run") or ""
+            tab = getattr(self, "_tab", "")
+            current_snap = mine if mine.get("enabled") else {
+                "filter": snap,
+                "align": asnap,
+                "video": vsnap,
+                "custom": vsnap,
+                "catalog": csnap,
+            }.get(tab, snap)
+            nxt = current_snap.get("next_run") or ""
             if running:
                 self.status.set("运行中…  " + (logs[-1]["msg"] if logs else ""))
                 self._set_badge("运行中", C["accent"])
@@ -2343,40 +2955,23 @@ class DesktopApp(tk.Tk):
             elif job.get("error"):
                 self.status.set("失败：" + str(job.get("error")))
                 self._set_badge("失败", C["bad"])
+            elif job.get("result"):
+                self.status.set(self._job_done_status(job))
+                self._set_badge("已完成", C["ok"])
             else:
                 self._set_badge("待命", C["sa"])
-                if snap.get("enabled"):
+                if current_snap.get("enabled"):
                     extra = f"  下次 {nxt}" if nxt else ""
-                    last = snap.get("last_sync") or ""
+                    last = current_snap.get("last_sync") or ""
                     if last:
                         extra += f"  上次 {last.replace('T', ' ')}"
-                    self.status.set(f"定时已开 · 每 {snap.get('minutes')} 分钟" + extra)
+                    self.status.set(f"定时已开 · 每 {current_snap.get('minutes')} 分钟" + extra)
                 else:
                     self.status.set("待命")
-            if hasattr(self, "sched_info"):
-                if snap.get("enabled"):
-                    self.sched_info.configure(text=f"已启动 · 每 {snap.get('minutes')} 分钟 · 下次 {nxt or '-'}")
-                else:
-                    self.sched_info.configure(text="定时未启动")
-            if hasattr(self, "align_sched_info"):
-                if asnap.get("enabled"):
-                    self.align_sched_info.configure(text=f"已启动 · 每 {asnap.get('minutes')} 分钟 · 下次 {asnap.get('next_run') or '-'}")
-                else:
-                    self.align_sched_info.configure(text="定时未启动")
-            if hasattr(self, "vd_sched_info"):
-                if vsnap.get("enabled"):
-                    self.vd_sched_info.configure(
-                        text=f"已启动 · 每 {vsnap.get('minutes')} 分钟 · 下次 {vsnap.get('next_run') or '-'}"
-                    )
-                else:
-                    self.vd_sched_info.configure(text="定时未启动")
-            if hasattr(self, "catalog_sched_info"):
-                if csnap.get("enabled"):
-                    self.catalog_sched_info.configure(
-                        text=f"已启动 · 每 {csnap.get('minutes')} 分钟 · 下次 {csnap.get('next_run') or '-'}"
-                    )
-                else:
-                    self.catalog_sched_info.configure(text="定时未启动")
+            self._set_sched_label("sched_info", snap)
+            self._set_sched_label("align_sched_info", asnap)
+            self._set_sched_label("vd_sched_info", mine if tab in ("video", "custom") else vsnap)
+            self._set_sched_label("catalog_sched_info", mine if tab == "catalog" else csnap)
         except Exception as exc:
             try:
                 write_app_log(f"界面刷新失败: {exc}")
@@ -2384,18 +2979,36 @@ class DesktopApp(tk.Tk):
                 pass
         if self._alive:
             try:
-                self._tick_id = self.after(800, self._tick)
+                self._tick_id = self.after(1500, self._tick)
             except Exception:
                 pass
 
+    def _set_sched_label(self, attr: str, snap: dict) -> None:
+        widget = getattr(self, attr, None)
+        if widget is None:
+            return
+        if snap.get("enabled"):
+            text = f"已启动 · 每 {snap.get('minutes')} 分钟 · 下次 {snap.get('next_run') or '-'}"
+        else:
+            text = "定时未启动"
+        if self._tick_cache.get(attr) == text:
+            return
+        self._tick_cache[attr] = text
+        widget.configure(text=text)
+
     def _on_close(self) -> None:
         self._alive = False
+        try:
+            write_app_log("窗口关闭")
+        except Exception:
+            pass
         if self._tick_id is not None:
             try:
                 self.after_cancel(self._tick_id)
             except Exception:
                 pass
         try:
+            stop_all_menu_schedulers()
             stop_scheduler()
             stop_align_scheduler()
             stop_video_scheduler()
@@ -2407,6 +3020,16 @@ class DesktopApp(tk.Tk):
 
 def main() -> None:
     os.chdir(SCRIPT_DIR)
+    try:
+        import faulthandler
+
+        crash_path = LOG_DIR / "crash.log"
+        crash_file = open(crash_path, "a", encoding="utf-8", errors="replace")
+        crash_file.write(f"\n---- {datetime.now().isoformat(timespec='seconds')} ----\n")
+        crash_file.flush()
+        faulthandler.enable(file=crash_file, all_threads=True)
+    except Exception:
+        pass
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(errors="replace")

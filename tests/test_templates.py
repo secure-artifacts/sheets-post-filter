@@ -10,7 +10,23 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import app  # noqa: E402
-from catalog_merge import _col_index, _pick_catalog_ws, _read_source_batches, run_catalog_merge  # noqa: E402
+from catalog_merge import (  # noqa: E402
+    _attach_source_column,
+    _catalog_name_excluded,
+    _col_index,
+    _combine_catalog_link,
+    _detect_date_index,
+    _filter_chunk_by_date,
+    _find_ws,
+    _get_or_create_sheet,
+    _pick_catalog_ws,
+    _read_source_batches,
+    _row_fingerprint,
+    _take_new_rows,
+    _worksheets_cached,
+    parse_catalog_link,
+    run_catalog_merge,
+)
 from fetch_posts import compact_sheet_rows, to_datetime, trim_trailing_empty_columns  # noqa: E402
 from roster_fill import (  # noqa: E402
     HOUR_SLOTS,
@@ -88,6 +104,71 @@ class TemplateConfigTests(unittest.TestCase):
             if first_lock.locked():
                 first_lock.release()
 
+    def test_cfg_from_payload_can_use_fresh_base(self):
+        cfg = app._cfg_from_payload(
+            {"vd_schedule_enabled": True, "vd_source_url": "https://example.com/src", "vd_types": ["wsp"]},
+            base=app.Config(),
+        )
+        self.assertTrue(cfg.vd_schedule_enabled)
+        self.assertEqual(cfg.vd_source_url, "https://example.com/src")
+        self.assertEqual(cfg.vd_types, ["wsp"])
+        cfg_rules = app._cfg_from_payload(
+            {
+                "vd_types": [
+                    {"name": "口播", "in_total": True, "in_item": False},
+                    {"name": "wsp", "in_total": False, "in_item": True},
+                ]
+            },
+            base=app.Config(),
+        )
+        self.assertEqual(cfg_rules.vd_types[0]["in_item"], False)
+        self.assertEqual(cfg_rules.vd_types[1]["in_total"], False)
+
+    def test_sync_schedulers_keep_video_when_other_menu_has_no_timer(self):
+        app.stop_all_menu_schedulers()
+        menus = [
+            {"id": "filter-1", "template": "filter", "settings": {"schedule_enabled": False, "schedule_minutes": 60}},
+            {
+                "id": "video-1",
+                "template": "video",
+                "settings": {
+                    "vd_schedule_enabled": True,
+                    "vd_schedule_minutes": 60,
+                    "vd_source_url": "https://docs.google.com/spreadsheets/d/aaaaaaaaaaaaaaaaaaaaaaaaaa/edit",
+                    "vd_dest_url": "https://docs.google.com/spreadsheets/d/bbbbbbbbbbbbbbbbbbbbbbbbbb/edit",
+                },
+            },
+        ]
+        app.sync_schedulers_from_menus(menus)
+        self.assertTrue(app.menu_schedule_snapshot("video-1")["enabled"])
+        self.assertTrue(app._video_schedule_snapshot()["enabled"])
+        app.sync_schedulers_from_menus(menus)
+        self.assertTrue(app.menu_schedule_snapshot("video-1")["enabled"])
+        self.assertIsNone(
+            app._menu_schedule_spec(
+                {"id": "video-2", "template": "video", "settings": {"vd_schedule_enabled": True, "vd_schedule_minutes": 30}}
+            )
+        )
+        app.stop_all_menu_schedulers()
+        self.assertFalse(app.menu_schedule_snapshot("video-1")["enabled"])
+
+    def test_custom_menu_timer_uses_video_job_kind(self):
+        spec = app._menu_schedule_spec(
+            {
+                "id": "custom-1",
+                "template": "custom",
+                "settings": {
+                    "vd_schedule_enabled": True,
+                    "vd_schedule_minutes": "90",
+                    "vd_source_url": "https://docs.google.com/spreadsheets/d/aaaaaaaaaaaaaaaaaaaaaaaaaa/edit",
+                    "vd_dest_url": "https://docs.google.com/spreadsheets/d/bbbbbbbbbbbbbbbbbbbbbbbbbb/edit",
+                },
+            }
+        )
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec["kind"], "video")
+        self.assertEqual(spec["minutes"], 90)
+
     def test_status_is_scoped_to_menu(self):
         first, _ = app._job_parts("status-menu-a")
         second, _ = app._job_parts("status-menu-b")
@@ -147,6 +228,162 @@ class CatalogTests(unittest.TestCase):
             extract_url('=HYPERLINK("https://docs.google.com/spreadsheets/d/abc1234567890abcdefghij/edit","表")'),
             "https://docs.google.com/spreadsheets/d/abc1234567890abcdefghij/edit",
         )
+
+    def test_catalog_reuses_worksheet_list(self):
+        calls = {"n": 0}
+        wanted = SimpleNamespace(title="1751-小源", id=995133928)
+
+        def listing():
+            calls["n"] += 1
+            return [SimpleNamespace(title="目录", id=1), wanted]
+
+        spreadsheet = SimpleNamespace(id="book", worksheets=listing)
+        first = _worksheets_cached(spreadsheet)
+        second = _worksheets_cached(spreadsheet)
+        self.assertIs(first, second)
+        self.assertEqual(calls["n"], 1)
+        self.assertIs(_find_ws(spreadsheet, gid=995133928), wanted)
+        self.assertEqual(calls["n"], 1)
+
+    def test_catalog_parses_internal_gid_hyperlink(self):
+        formula = '=HYPERLINK("#gid=995133928","1751-小源")'
+        parsed = parse_catalog_link(formula)
+        self.assertEqual(parsed["gid"], 995133928)
+        self.assertEqual(parsed["label"], "1751-小源")
+        self.assertTrue(parsed["internal"])
+        self.assertFalse(parsed["spreadsheet_id"])
+        combined = _combine_catalog_link("#gid=995133928", formula)
+        self.assertEqual(combined["gid"], 995133928)
+        self.assertEqual(combined["label"], "1751-小源")
+        wanted = SimpleNamespace(title="1751-小源", id=995133928)
+        spreadsheet = SimpleNamespace(worksheets=lambda: [SimpleNamespace(title="目录", id=1), wanted])
+        self.assertIs(_find_ws(spreadsheet, gid=995133928), wanted)
+        self.assertIs(_find_ws(spreadsheet, title="1751-小源"), wanted)
+
+    def test_catalog_merges_internal_gid_sheets(self):
+        index_ws = SimpleNamespace(title="目录", id=11)
+        wanted_ws = SimpleNamespace(title="1751-小源", id=995133928)
+        index_ss = SimpleNamespace(title="专页目录", id="index", worksheets=lambda: [index_ws, wanted_ws])
+        target_ss = SimpleNamespace(title="目标", id="target")
+        cfg = app.Config(
+            catalog_index_url="index-url",
+            catalog_target_url="target-url",
+            catalog_index_sheet="目录",
+            catalog_url_col="B",
+            catalog_sheet_col="D",
+            catalog_start_row=2,
+        )
+        cfg.resolve_credentials = lambda: ROOT / "config.example.json"
+
+        def fake_open(_gc, value, log=print):
+            return {"index-url": index_ss, "target-url": target_ss}[value]
+
+        def fake_read(ws, log=print):
+            if ws is index_ws:
+                return [
+                    ["专页ID", "姓名", "", ""],
+                    ["1751", '=HYPERLINK("#gid=995133928","1751-小源")', "", ""],
+                ]
+            return []
+
+        def fake_batches(ws, log, cancelled=None):
+            if ws is wanted_ws:
+                yield [["表头"], ["小源数据"]]
+
+        captured = {}
+
+        class FakeWriter:
+            def __init__(self, ss, sheet_name, start_row, log):
+                self.rows = []
+                self.width = 1
+                captured["writer"] = self
+
+            def add_rows(self, rows):
+                self.rows.extend(rows)
+                self.width = max((len(row) for row in self.rows), default=1)
+
+            def finish(self):
+                return len(self.rows)
+
+        with (
+            patch("catalog_merge.authorize_cfg", return_value=object()),
+            patch("catalog_merge.open_by_url_or_id", side_effect=fake_open),
+            patch("catalog_merge.pick_source_ws", return_value=index_ws),
+            patch("catalog_merge.read_sheet_values", side_effect=fake_read),
+            patch("catalog_merge._read_source_batches", side_effect=fake_batches),
+            patch("catalog_merge._read_link_column", return_value=["#gid=995133928"]),
+            patch("catalog_merge._StreamingWriter", FakeWriter),
+        ):
+            result = run_catalog_merge(cfg, log=lambda _message: None)
+        self.assertEqual(result["total_rows"], 2)
+        self.assertEqual(captured["writer"].rows, [["来源", "表头"], ["1751-小源", "小源数据"]])
+        self.assertTrue(any(item.get("sheet") == "1751-小源" and not item.get("error") for item in result["sources"]))
+
+    def test_catalog_skips_excluded_sheet_names(self):
+        self.assertTrue(_catalog_name_excluded("导航", ["导航"]))
+        self.assertTrue(_catalog_name_excluded("1751-小源", ["1751*"]))
+        self.assertFalse(_catalog_name_excluded("1751-小源", ["导航"]))
+        index_ws = SimpleNamespace(title="目录", id=11)
+        skip_ws = SimpleNamespace(title="导航", id=22)
+        keep_ws = SimpleNamespace(title="1751-小源", id=995133928)
+        index_ss = SimpleNamespace(title="专页目录", id="index", worksheets=lambda: [index_ws, skip_ws, keep_ws])
+        target_ss = SimpleNamespace(title="目标", id="target")
+        cfg = app.Config(
+            catalog_index_url="index-url",
+            catalog_target_url="target-url",
+            catalog_index_sheet="目录",
+            catalog_url_col="B",
+            catalog_sheet_col="D",
+            catalog_start_row=2,
+            catalog_exclude_sheets=["导航"],
+        )
+        cfg.resolve_credentials = lambda: ROOT / "config.example.json"
+
+        def fake_open(_gc, value, log=print):
+            return {"index-url": index_ss, "target-url": target_ss}[value]
+
+        def fake_read(ws, log=print):
+            if ws is index_ws:
+                return [
+                    ["专页ID", "姓名", "", ""],
+                    ["nav", '=HYPERLINK("#gid=22","导航")', "", ""],
+                    ["1751", '=HYPERLINK("#gid=995133928","1751-小源")', "", ""],
+                ]
+            return []
+
+        def fake_batches(ws, log, cancelled=None):
+            if ws is skip_ws:
+                yield [["不该出现"]]
+            if ws is keep_ws:
+                yield [["表头"], ["小源数据"]]
+
+        captured = {}
+
+        class FakeWriter:
+            def __init__(self, ss, sheet_name, start_row, log):
+                self.rows = []
+                self.width = 1
+                captured["writer"] = self
+
+            def add_rows(self, rows):
+                self.rows.extend(rows)
+                self.width = max((len(row) for row in self.rows), default=1)
+
+            def finish(self):
+                return len(self.rows)
+
+        with (
+            patch("catalog_merge.authorize_cfg", return_value=object()),
+            patch("catalog_merge.open_by_url_or_id", side_effect=fake_open),
+            patch("catalog_merge.pick_source_ws", return_value=index_ws),
+            patch("catalog_merge.read_sheet_values", side_effect=fake_read),
+            patch("catalog_merge._read_source_batches", side_effect=fake_batches),
+            patch("catalog_merge._read_link_column", return_value=["#gid=22", "#gid=995133928"]),
+            patch("catalog_merge._StreamingWriter", FakeWriter),
+        ):
+            result = run_catalog_merge(cfg, log=lambda _message: None)
+        self.assertEqual(captured["writer"].rows, [["来源", "表头"], ["1751-小源", "小源数据"]])
+        self.assertFalse(any(item.get("sheet") == "导航" and item.get("rows") for item in result["sources"]))
 
     def test_catalog_read_stays_inside_grid(self):
         requested: list[str] = []
@@ -228,7 +465,7 @@ class CatalogTests(unittest.TestCase):
         ):
             result = run_catalog_merge(cfg, log=lambda _message: None)
         self.assertEqual(result["total_rows"], 2)
-        self.assertEqual(captured["writer"].rows, [["表头"], ["数据"]])
+        self.assertEqual(captured["writer"].rows, [["来源", "表头"], ["目标录", "数据"]])
 
     def test_catalog_survives_emoji_in_sheet_title(self):
         index_ws = SimpleNamespace(title="目录")
@@ -287,7 +524,7 @@ class CatalogTests(unittest.TestCase):
             result = run_catalog_merge(cfg, log=exploding_log)
         self.assertTrue(result["ok"])
         self.assertEqual(result["total_rows"], 2)
-        self.assertEqual(captured["writer"].rows, [["表头"], ["数据"]])
+        self.assertEqual(captured["writer"].rows, [["来源", "表头"], ["🌛 Massane 录", "数据"]])
 
 
 class VideoReportTests(unittest.TestCase):
@@ -619,6 +856,152 @@ class VideoReportTests(unittest.TestCase):
         )
         self.assertEqual(rows[2][1:4], ["总计数", "逐条计数", "开场口播"])
         self.assertEqual(len(rows[3]), 4)
+
+    def test_extra_columns_count_videos_not_duration(self):
+        records = [{"name": "甲", "type": "口播", "date": "2026-08-01", "sec": 10} for _ in range(5)]
+        _names, rows = _report_matrix(
+            records, None, None, 30, "全部", types=["口播"], preferred_names=["甲"]
+        )
+        self.assertEqual(rows[3][1], 1.67)
+        self.assertEqual(rows[3][2], 5)
+        self.assertEqual(rows[3][3], 5)
+        day_row = next(row for row in rows[4:] if row[0] == "2026-08-01")
+        self.assertEqual(day_row[3], 5)
+
+    def test_type_rules_gate_total_and_item_but_extra_still_counts(self):
+        records = [
+            {"name": "甲", "type": "口播", "date": "2026-08-01", "sec": 90},
+            {"name": "甲", "type": "wsp", "date": "2026-08-01", "sec": 30},
+        ]
+        rules = [
+            {"name": "口播", "in_total": True, "in_item": True},
+            {"name": "wsp", "in_total": False, "in_item": False},
+        ]
+        _names, rows = _report_matrix(
+            records,
+            None,
+            None,
+            30,
+            "全部",
+            types=["口播", "wsp"],
+            preferred_names=["甲"],
+            type_rules=rules,
+        )
+        self.assertEqual(rows[3][1], 3)
+        self.assertEqual(rows[3][2], 3)
+        self.assertEqual(rows[3][3], 1)
+        self.assertEqual(rows[3][4], 1)
+
+    def test_catalog_dedupe_and_date_filter_helpers(self):
+        from datetime import date
+
+        self.assertEqual(_detect_date_index(["姓名", "登记日期", "电话"]), 1)
+        self.assertEqual(_row_fingerprint(["1751-小源", "123", ""]), ("1751-小源", "123"))
+        kept, skipped = _filter_chunk_by_date(
+            [["日期", "电话"], ["2026-08-10", "1"], ["2026-09-01", "2"], ["", "3"]],
+            0,
+            date(2026, 8, 1),
+            date(2026, 8, 31),
+            True,
+        )
+        self.assertEqual(skipped, 2)
+        self.assertEqual(kept, [["日期", "电话"], ["2026-08-10", "1"]])
+        seen: set[tuple[str, ...]] = set()
+        first, n1 = _take_new_rows([["1751-小源", "123"]], seen)
+        second, n2 = _take_new_rows([["1751-小源", "123"], ["1626-小瑞", "456"]], seen)
+        self.assertEqual(first, [["1751-小源", "123"]])
+        self.assertEqual(n1, 0)
+        self.assertEqual(n2, 1)
+        self.assertEqual(second, [["1626-小瑞", "456"]])
+
+    def test_catalog_merge_skips_out_of_range_dates(self):
+        index_ws = SimpleNamespace(title="目录", id=11)
+        wanted_ws = SimpleNamespace(title="1751-小源", id=995133928)
+        index_ss = SimpleNamespace(title="专页目录", id="index", worksheets=lambda: [index_ws, wanted_ws])
+        target_ss = SimpleNamespace(title="目标", id="target")
+        cfg = app.Config(
+            catalog_index_url="index-url",
+            catalog_target_url="target-url",
+            catalog_index_sheet="目录",
+            catalog_url_col="B",
+            catalog_sheet_col="D",
+            catalog_start_row=2,
+            catalog_date_filter_enabled=True,
+            catalog_start_date="2026-08-01",
+            catalog_end_date="2026-08-31",
+            catalog_date_col="A",
+        )
+        cfg.resolve_credentials = lambda: ROOT / "config.example.json"
+
+        def fake_open(_gc, value, log=print):
+            return {"index-url": index_ss, "target-url": target_ss}[value]
+
+        def fake_read(ws, log=print):
+            if ws is index_ws:
+                return [["", "", "", ""], ["", '=HYPERLINK("#gid=995133928","1751-小源")', "", ""]]
+            return []
+
+        def fake_batches(ws, log, cancelled=None):
+            if ws is wanted_ws:
+                yield [["日期", "电话"], ["2026-08-10", "111"], ["2026-09-01", "222"]]
+
+        captured = {}
+
+        class FakeWriter:
+            def __init__(self, ss, sheet_name, start_row, log):
+                self.rows = []
+                captured["writer"] = self
+
+            def add_rows(self, rows):
+                self.rows.extend(rows)
+
+            def finish(self):
+                return len(self.rows)
+
+        with (
+            patch("catalog_merge.authorize_cfg", return_value=object()),
+            patch("catalog_merge.open_by_url_or_id", side_effect=fake_open),
+            patch("catalog_merge.pick_source_ws", return_value=index_ws),
+            patch("catalog_merge.read_sheet_values", side_effect=fake_read),
+            patch("catalog_merge._read_source_batches", side_effect=fake_batches),
+            patch("catalog_merge._read_link_column", return_value=["#gid=995133928"]),
+            patch("catalog_merge._StreamingWriter", FakeWriter),
+        ):
+            result = run_catalog_merge(cfg, log=lambda _message: None)
+        self.assertEqual(
+            captured["writer"].rows,
+            [["来源", "日期", "电话"], ["1751-小源", "2026-08-10", "111"]],
+        )
+        self.assertEqual(result["date_skipped"], 1)
+        self.assertEqual(result["sheet_total"], result["total_rows"])
+        self.assertTrue(result["ok"])
+
+    def test_catalog_source_column_uses_sheet_name(self):
+        self.assertEqual(
+            _attach_source_column([["姓名", "电话"], ["张三", "123"]], "1751-小源", True),
+            [["来源", "姓名", "电话"], ["1751-小源", "张三", "123"]],
+        )
+        self.assertEqual(
+            _attach_source_column([["张三", "123"]], "1626-小瑞", False),
+            [["1626-小瑞", "张三", "123"]],
+        )
+        self.assertEqual(
+            _attach_source_column([["来源", "姓名"], ["张三"]], "1751-小源", True),
+            [["来源", "姓名"], ["1751-小源", "张三"]],
+        )
+
+    def test_catalog_keeps_existing_sheet_instead_of_wiping(self):
+        resized = []
+        ws = SimpleNamespace(
+            title="电话号码备份",
+            row_count=164003,
+            col_count=11,
+            resize=lambda **kwargs: resized.append(kwargs),
+        )
+        spreadsheet = SimpleNamespace(worksheet=lambda _title: ws)
+        got = _get_or_create_sheet(spreadsheet, "电话号码备份", log=lambda _message: None)
+        self.assertIs(got, ws)
+        self.assertEqual(resized, [])
 
 
 if __name__ == "__main__":

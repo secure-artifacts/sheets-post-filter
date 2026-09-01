@@ -231,18 +231,28 @@ def _matched_patterns(value: str, patterns: list[str]) -> list[str]:
 
 
 def _cfg_type_list(raw) -> list[str]:
+    return [item["name"] for item in _cfg_type_rules(raw)]
+
+
+def _cfg_type_rules(raw) -> list[dict[str, Any]]:
+    """Section-4 types: name plus whether they feed 总计数 / 逐条计数. Extra columns always count videos."""
     if isinstance(raw, str):
-        parts = raw.replace("，", "\n").replace(",", "\n").replace(";", "\n").splitlines()
-        values = parts
+        values = raw.replace("，", "\n").replace(",", "\n").replace(";", "\n").splitlines()
     else:
         values = raw or []
-    out: list[str] = []
+    out: list[dict[str, Any]] = []
     seen: set[str] = set()
     for item in values:
-        text = _norm_type(item)
+        if isinstance(item, dict):
+            text = _norm_type(item.get("name") or item.get("type") or "")
+            in_total = bool(item.get("in_total", True))
+            in_item = bool(item.get("in_item", True))
+        else:
+            text = _norm_type(item)
+            in_total, in_item = True, True
         if text and text not in seen:
             seen.add(text)
-            out.append(text)
+            out.append({"name": text, "in_total": in_total, "in_item": in_item})
     return out
 
 
@@ -814,9 +824,27 @@ def _report_matrix(
     preferred_names: list[str] | None = None,
     count_mode: str = "divide_total",
     lock_names: bool = False,
+    type_rules: list[dict[str, Any]] | None = None,
 ) -> tuple[list[str], list[list[Any]]]:
-    """每人固定两列（总计数=秒÷除数，逐条计数），后面每加一个分类多一列。"""
+    """每人固定两列（总计数=秒÷除数，逐条计数），后面每加一个分类多一列（按视频个数）。"""
     extra = [_norm_type(value) for value in (types or []) if _norm_type(value)]
+    rules = {
+        _norm_type(item.get("name")): (bool(item.get("in_total", True)), bool(item.get("in_item", True)))
+        for item in (type_rules or [])
+        if isinstance(item, dict) and _norm_type(item.get("name"))
+    }
+
+    def _flags_for(typ: str) -> tuple[bool, bool]:
+        if not rules:
+            return True, True
+        key = _norm_type(typ)
+        if key in rules:
+            return rules[key]
+        for name, flags in rules.items():
+            if _type_equals(typ, name):
+                return flags
+        return True, True
+
     totals: dict[str, float] = defaultdict(float)
     daily: dict[tuple[Any, str], float] = defaultdict(float)
     item_totals: dict[str, int] = defaultdict(int)
@@ -825,9 +853,6 @@ def _report_matrix(
     cat_daily: dict[tuple[Any, str, str], int] = defaultdict(int)
     dates: set[Any] = set()
     for rec in records:
-        sec = rec.get("sec")
-        if sec is None:
-            continue
         if not _in_date_range(rec.get("date"), start_d, end_d):
             continue
         name = _norm_name(rec.get("name"))
@@ -837,16 +862,22 @@ def _report_matrix(
         if day is None:
             continue
         typ = rec.get("type")
-        value = float(sec)
-        totals[name] += value
-        daily[(day, name)] += value
-        item_count = _per_video_count(value)
-        item_totals[name] += item_count
-        item_daily[(day, name)] += item_count
+        in_total, in_item = _flags_for(typ)
+        sec = rec.get("sec")
+        if sec is not None:
+            value = float(sec)
+            if in_total:
+                totals[name] += value
+                daily[(day, name)] += value
+            if in_item:
+                item_count = _per_video_count(value)
+                item_totals[name] += item_count
+                item_daily[(day, name)] += item_count
+        # Extra category columns always count videos (5 videos → 5), never duration/30s.
         for pattern in extra:
             if _type_equals(typ, pattern):
-                cat_item[(name, pattern)] += item_count
-                cat_daily[(day, name, pattern)] += item_count
+                cat_item[(name, pattern)] += 1
+                cat_daily[(day, name, pattern)] += 1
         dates.add(day)
 
     names: list[str] = []
@@ -857,9 +888,10 @@ def _report_matrix(
             seen.add(name)
             names.append(name)
     if not lock_names or not names:
+        discovered = set(totals) | set(item_totals) | {name for name, _pattern in cat_item}
         names.extend(
             sorted(
-                (name for name in totals if name not in seen),
+                (name for name in discovered if name not in seen),
                 key=lambda value: value.casefold(),
             )
         )
@@ -906,6 +938,10 @@ def _format_report_sheet(ws, start_row: int, names: list[str], extra_types: list
     width = 1 + len(names) * block
     name_row = start_row + 1
     last_row = start_row - 1 + max(payload_len, 4)
+    try:
+        last_row = max(last_row, int(getattr(ws, "row_count", last_row) or last_row))
+    except Exception:
+        pass
     try:
         ws.spreadsheet.batch_update(
             {
@@ -1196,7 +1232,7 @@ def _merge_video_payload(payload: list[list[Any]], existing: dict[str, Any] | No
     return [range_row[:width], ["日期"] + name_cells, ["统计项"] + stat_cells, ["本月汇总"] + summary, *date_rows]
 
 
-def _write_report_sheet(ws, out_start: int, include_headers: bool, range_label: str, unit: int, records, start_d, end_d, log: LogFn, types: list[str] | None = None, count_mode: str = "divide_total") -> int:
+def _write_report_sheet(ws, out_start: int, include_headers: bool, range_label: str, unit: int, records, start_d, end_d, log: LogFn, types: list[str] | None = None, count_mode: str = "divide_total", type_rules: list[dict[str, Any]] | None = None) -> int:
     existing_names: list[str] = []
     try:
         current_header = ws.row_values(out_start + 1)
@@ -1227,6 +1263,7 @@ def _write_report_sheet(ws, out_start: int, include_headers: bool, range_label: 
         preferred_names=existing_names,
         count_mode=count_mode,
         lock_names=header_locked,
+        type_rules=type_rules,
     )
     payload = _merge_video_payload(payload, previous, extra)
     labels = ["总计数", "逐条计数"] + extra
@@ -1236,15 +1273,9 @@ def _write_report_sheet(ws, out_start: int, include_headers: bool, range_label: 
     old_end_col = index_to_col_letter(max(int(getattr(ws, "col_count", 1) or 1) - 1, total_cols - 1))
     need_rows = out_start - 1 + len(payload) + 10
     try:
-        # 按实际人数和分类列收紧，避免旧空白列把颜色刷没、也避免单元格爆炸。
         safe_resize_ws(ws, max(need_rows, 40), max(total_cols, 1), log=log)
-    except RuntimeError:
-        try:
-            ws.resize(rows=1, cols=1)
-            safe_resize_ws(ws, max(need_rows, 40), max(total_cols, 1), log=log)
-        except Exception as inner:
-            raise RuntimeError("数据表单元格超过上限，请换空表或删掉空白列后再提取。") from inner
-        header_locked = False
+    except RuntimeError as exc:
+        raise RuntimeError("数据表单元格超过上限，请换空表或删掉空白列后再提取。已写入的内容不会清成 1 格。") from exc
     if header_locked and len(payload) > 3:
         body = payload[3:]
         write_start = out_start + 3
@@ -1278,12 +1309,11 @@ def _write_report_sheet(ws, out_start: int, include_headers: bool, range_label: 
             ws.batch_clear(leftover)
     except Exception:
         pass
-    if not header_locked:
-        try:
-            _format_report_sheet(ws, out_start, names, extra, len(payload), log)
-            log("已按人分色、合并姓名，并加上总计数 / 逐条 / 分类列")
-        except Exception as exc:
-            log(f"设置时长数据表样式失败，数据已写入：{exc}")
+    try:
+        _format_report_sheet(ws, out_start, names, extra, len(payload), log)
+        log("已按人分色同步到全部日期行（含新增加的日期）")
+    except Exception as exc:
+        log(f"设置时长数据表样式失败，数据已写入：{exc}")
     log(f"已写入「{ws.title}」：{len(names)} 人，{max(0, len(payload) - 4)} 个日期")
     return len(names)
 
@@ -1381,6 +1411,10 @@ def _format_custom_person_sheet(ws, out_start: int, names: list[str], categories
     block = len(categories)
     width = 1 + len(names) * block
     last_row = out_start - 1 + len(payload)
+    try:
+        last_row = max(last_row, int(getattr(ws, "row_count", last_row) or last_row))
+    except Exception:
+        pass
     try:
         ws.spreadsheet.batch_update(
             {
@@ -1599,13 +1633,7 @@ def _write_custom_report_sheet(ws, out_start: int, unit: int, records, log: LogF
     try:
         safe_resize_ws(ws, max(needed_rows, 40), max(width, 8), log=log)
     except RuntimeError as exc:
-        log(str(exc))
-        try:
-            ws.resize(rows=1, cols=1)
-            safe_resize_ws(ws, max(needed_rows, 40), max(width, 8), log=log)
-        except Exception as inner:
-            raise RuntimeError("数据表单元格超过上限，请换一个空的目标表或删掉空白列后再统计。") from inner
-        header_locked = False
+        raise RuntimeError("数据表单元格超过上限，请换空表或删掉空白列后再统计。已写入的内容不会清成 1 格。") from exc
     if header_locked and len(payload) > 4:
         body = payload[4:]
         write_start = out_start + 4
@@ -1636,12 +1664,11 @@ def _write_custom_report_sheet(ws, out_start: int, unit: int, records, log: LogF
         log=log,
         what="写入自定义分类数据表",
     )
-    if not header_locked:
-        try:
-            _format_custom_person_sheet(ws, out_start, names, categories, payload, log)
-            log("已按人分色、合并姓名、收紧列宽并加上分隔线")
-        except Exception as exc:
-            log(f"设置分类汇总样式失败，数据已写入：{exc}")
+    try:
+        _format_custom_person_sheet(ws, out_start, names, categories, payload, log)
+        log("已按人分色同步到全部日期行（含新增加的日期）")
+    except Exception as exc:
+        log(f"设置分类汇总样式失败，数据已写入：{exc}")
     log(f"已写入「{ws.title}」：{len(names)} 人，{len(categories)} 个分类，{max(0, len(payload) - 7)} 个日期")
     return len(names)
 
@@ -1718,6 +1745,7 @@ def run_video_duration(cfg, log: LogFn = print, cancelled=None) -> dict[str, Any
             log("统计方式：上面这些分类不计入，未分类和其他全部归入「" + other_category + "」")
     log_sheet = (getattr(cfg, "vd_log_sheet", "日志表") or "日志表").strip()
     report_sheet = (getattr(cfg, "vd_report_sheet", "数据表") or "数据表").strip()
+    type_rules = _cfg_type_rules(getattr(cfg, "vd_types", None))
     report_categories = _cfg_type_list(getattr(cfg, "vd_report_categories", None))
     if write_log and not report_categories and type_filters:
         report_categories = list(type_filters)
@@ -1966,6 +1994,7 @@ def run_video_duration(cfg, log: LogFn = print, cancelled=None) -> dict[str, Any
             log,
             report_categories,
             count_mode,
+            type_rules,
         )
         return people
 
