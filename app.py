@@ -15,6 +15,7 @@ from datetime import date, datetime, timedelta
 from flask import Flask, jsonify, render_template, request
 
 from catalog_merge import run_catalog_merge
+from post_aggregate import run_post_aggregate
 from roster_fill import run_roster_fill
 
 from fetch_posts import (
@@ -26,6 +27,7 @@ from fetch_posts import (
     authorize_cfg,
     copy_default_fields,
     field_from_dict,
+    discover_credential_files,
     load_config,
     load_sync_state,
     normalize_sources,
@@ -98,6 +100,13 @@ _video_sched = {
 _catalog_sched = {
     "enabled": False,
     "minutes": 180,
+    "only_if_changed": False,
+    "next_run": None,
+    "last_msg": "",
+}
+_posts_sched = {
+    "enabled": False,
+    "minutes": 120,
     "only_if_changed": False,
     "next_run": None,
     "last_msg": "",
@@ -219,6 +228,8 @@ def _queue_worker_loop() -> None:
                 _run_video_job(cfg, from_schedule=from_schedule, job_key=job_key)
             elif kind == "catalog":
                 _run_catalog_job(cfg, job_key=job_key)
+            elif kind == "posts":
+                _run_posts_job(cfg, job_key=job_key)
             elif kind == "roster":
                 _run_roster_job(cfg, job_key=job_key)
             elif kind == "publish":
@@ -325,6 +336,22 @@ def _cfg_from_payload(data: dict, base: Config | None = None) -> Config:
         "catalog_date_col": "catalog_date_col",
         "catalog_start_date": "catalog_start_date",
         "catalog_end_date": "catalog_end_date",
+        "pa_list_url": "pa_list_url",
+        "pa_list_sheet": "pa_list_sheet",
+        "pa_link_col": "pa_link_col",
+        "pa_tag_col": "pa_tag_col",
+        "pa_sub_sheet": "pa_sub_sheet",
+        "pa_date_col": "pa_date_col",
+        "pa_start_date": "pa_start_date",
+        "pa_end_date": "pa_end_date",
+        "pa_lookup_url": "pa_lookup_url",
+        "pa_lookup_sheet": "pa_lookup_sheet",
+        "pa_lookup_key_col": "pa_lookup_key_col",
+        "pa_lookup_value_col": "pa_lookup_value_col",
+        "pa_match_col": "pa_match_col",
+        "pa_library_write_col": "pa_library_write_col",
+        "pa_target_url": "pa_target_url",
+        "pa_output_sheet": "pa_output_sheet",
         "ui_active_menu": "ui_active_menu",
         "vd_type_filter_mode": "vd_type_filter_mode",
         "vd_other_category": "vd_other_category",
@@ -401,6 +428,13 @@ def _cfg_from_payload(data: dict, base: Config | None = None) -> Config:
             cfg.catalog_exclude_sheets = [ln.strip() for ln in parts if ln.strip()]
         elif isinstance(raw_exs, list):
             cfg.catalog_exclude_sheets = [str(x).strip() for x in raw_exs if str(x).strip()]
+    if "pa_source_cols" in data:
+        raw_pc = data.get("pa_source_cols")
+        if isinstance(raw_pc, str):
+            parts = raw_pc.replace("，", ",").replace(";", ",").replace(" ", ",").split(",")
+            cfg.pa_source_cols = [ln.strip().upper() for ln in parts if ln.strip()]
+        elif isinstance(raw_pc, list):
+            cfg.pa_source_cols = [str(x).strip().upper() for x in raw_pc if str(x).strip()]
     if "align_headers" in data:
         raw_h = data.get("align_headers")
         if isinstance(raw_h, str):
@@ -475,13 +509,19 @@ def _cfg_from_payload(data: dict, base: Config | None = None) -> Config:
         "catalog_add_source",
         "catalog_skip_existing",
         "catalog_date_filter_enabled",
+        "pa_date_filter_enabled",
+        "pa_include_tag",
+        "pa_lookup_enabled",
+        "pa_write_library",
+        "pa_include_headers",
+        "pa_schedule_enabled",
         "vd_date_filter_enabled",
         "vd_write_log",
         "vd_empty_to_other",
     ):
         if flag in data:
             setattr(cfg, flag, bool(data[flag]))
-    for key in ("output_start_row", "hot_start_row", "align_start_row", "align_header_row", "vd_start_row", "vd_out_start_row", "catalog_start_row", "catalog_output_start_row", "roster_start_row", "roster_date_start_row"):
+    for key in ("output_start_row", "hot_start_row", "align_start_row", "align_header_row", "vd_start_row", "vd_out_start_row", "catalog_start_row", "catalog_output_start_row", "roster_start_row", "roster_date_start_row", "pa_start_row", "pa_output_start_row", "pa_schedule_minutes"):
         if key in data and str(data[key]).strip():
             try:
                 setattr(cfg, key, max(1, int(data[key])))
@@ -601,6 +641,10 @@ def _catalog_schedule_snapshot() -> dict:
     return _snap(_catalog_sched, "catalog")
 
 
+def _posts_schedule_snapshot() -> dict:
+    return _snap(_posts_sched, "posts")
+
+
 def menu_schedule_snapshot(menu_id: str) -> dict:
     with _sched_lock:
         st = _menu_schedules.get(str(menu_id) or "")
@@ -624,6 +668,7 @@ def _template_schedule_kind(template: str) -> str | None:
         "video": "video",
         "custom": "video",
         "catalog": "catalog",
+        "posts": "posts",
     }.get(str(template or ""))
 
 
@@ -649,6 +694,12 @@ def _menu_schedule_spec(item: dict) -> dict | None:
             minutes = int(settings.get("vd_schedule_minutes") or 180)
             only = False
             if not str(settings.get("vd_source_url") or "").strip() or not str(settings.get("vd_dest_url") or "").strip():
+                enabled = False
+        elif kind == "posts":
+            enabled = bool(settings.get("pa_schedule_enabled"))
+            minutes = int(settings.get("pa_schedule_minutes") or 120)
+            only = False
+            if not str(settings.get("pa_list_url") or "").strip():
                 enabled = False
         else:
             enabled = bool(settings.get("catalog_schedule_enabled"))
@@ -678,9 +729,14 @@ def _cfg_for_menu_id(menu_id: str) -> Config:
     cfg = _cfg_from_payload(item.get("settings") or {}, base=Config())
     cfg.ui_menus = stored.ui_menus
     cfg.ui_active_menu = menu_id
-    if not getattr(cfg, "credentials_file", ""):
+    found = discover_credential_files(stored, stored.ui_menus, include_copied=False)
+    if not found:
+        found = discover_credential_files(stored, stored.ui_menus)
+    if found:
+        cfg.credentials_files = found
+        cfg.credentials_file = found[0]
+    elif not getattr(cfg, "credentials_file", ""):
         cfg.credentials_file = stored.credentials_file
-    if not getattr(cfg, "credentials_files", None):
         cfg.credentials_files = list(stored.credentials_files or [])
     return cfg
 
@@ -696,6 +752,7 @@ def _mirror_kind_schedules_locked() -> None:
         "align": _align_sched,
         "video": _video_sched,
         "catalog": _catalog_sched,
+        "posts": _posts_sched,
     }
     for kind, slot in mapping.items():
         src = first.get(kind)
@@ -760,7 +817,7 @@ def _try_fire(st: dict, kind: str, job_key: str = "", cfg_factory=None) -> None:
     if datetime.now() < nxt:
         return
     job_key = job_key or menu_id or f"schedule:{kind}"
-    labels = {"filter": "筛选汇总", "align": "表头对齐", "video": "视频时长", "catalog": "目录汇总"}
+    labels = {"filter": "筛选汇总", "align": "表头对齐", "video": "视频时长", "catalog": "目录汇总", "posts": "贴文汇总"}
     queued = False
     try:
         cfg = cfg_factory() if cfg_factory else ( _cfg_for_menu_id(menu_id) if menu_id else load_config() )
@@ -812,6 +869,7 @@ def _scheduler_loop() -> None:
             (_align_sched, "align"),
             (_video_sched, "video"),
             (_catalog_sched, "catalog"),
+            (_posts_sched, "posts"),
         ):
             try:
                 _try_fire(st, kind)
@@ -1048,6 +1106,32 @@ def api_config():
                 "catalog_date_col": cfg.catalog_date_col,
                 "catalog_start_date": cfg.catalog_start_date,
                 "catalog_end_date": cfg.catalog_end_date,
+                "pa_list_url": cfg.pa_list_url,
+                "pa_list_sheet": cfg.pa_list_sheet,
+                "pa_link_col": cfg.pa_link_col,
+                "pa_tag_col": cfg.pa_tag_col,
+                "pa_start_row": cfg.pa_start_row,
+                "pa_sub_sheet": cfg.pa_sub_sheet,
+                "pa_source_cols": cfg.pa_source_cols,
+                "pa_date_col": cfg.pa_date_col,
+                "pa_date_filter_enabled": cfg.pa_date_filter_enabled,
+                "pa_start_date": cfg.pa_start_date,
+                "pa_end_date": cfg.pa_end_date,
+                "pa_include_tag": cfg.pa_include_tag,
+                "pa_lookup_enabled": cfg.pa_lookup_enabled,
+                "pa_lookup_url": cfg.pa_lookup_url,
+                "pa_lookup_sheet": cfg.pa_lookup_sheet,
+                "pa_lookup_key_col": cfg.pa_lookup_key_col,
+                "pa_lookup_value_col": cfg.pa_lookup_value_col,
+                "pa_match_col": cfg.pa_match_col,
+                "pa_write_library": cfg.pa_write_library,
+                "pa_library_write_col": cfg.pa_library_write_col,
+                "pa_target_url": cfg.pa_target_url,
+                "pa_output_sheet": cfg.pa_output_sheet,
+                "pa_output_start_row": cfg.pa_output_start_row,
+                "pa_include_headers": cfg.pa_include_headers,
+                "pa_schedule_enabled": cfg.pa_schedule_enabled,
+                "pa_schedule_minutes": cfg.pa_schedule_minutes,
                 "catalog_exclude_sheets": cfg.catalog_exclude_sheets,
                 "ui_menus": cfg.ui_menus,
                 "ui_active_menu": cfg.ui_active_menu,
@@ -1192,6 +1276,30 @@ def start_catalog_job(cfg: Config) -> str | None:
         return "请填写目标表链接"
     save_config(cfg)
     return enqueue_job("catalog", cfg)
+
+
+def _run_posts_job(cfg: Config, job_key: str = "default") -> None:
+    job, lock = _job_parts(job_key)
+    try:
+        job["result"] = run_post_aggregate(
+            cfg,
+            log=lambda message: _log(message, job),
+            cancelled=lambda: job_cancelled(job_key),
+        )
+    except Exception as e:
+        _record_job_failure(e, "贴文汇总", job)
+    finally:
+        job["running"] = False
+        job["finished_at"] = datetime.now().strftime("%H:%M:%S")
+        if lock.locked():
+            lock.release()
+
+
+def start_posts_job(cfg: Config) -> str | None:
+    if not str(getattr(cfg, "pa_list_url", "") or "").strip():
+        return "请填写数据列表表格链接"
+    save_config(cfg)
+    return enqueue_job("posts", cfg)
 
 
 def _run_roster_job(cfg: Config, job_key: str = "default") -> None:

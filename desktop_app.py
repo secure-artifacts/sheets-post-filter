@@ -24,7 +24,9 @@ from fetch_posts import (
     Config,
     authorize,
     copy_default_fields,
+    discover_credential_files,
     load_config,
+    normalize_credential_paths,
     peek_source_headers,
     save_config,
     service_account_email,
@@ -42,6 +44,8 @@ from app import (
     start_align_job,
     start_catalog_job,
     start_catalog_scheduler,
+    start_posts_job,
+    _posts_schedule_snapshot,
     start_roster_job,
     start_align_scheduler,
     start_filter_job,
@@ -244,6 +248,7 @@ class DesktopApp(tk.Tk):
         self._vd_report_rows: list[tk.Frame] = []
         self._vd_extra_col_rows: list[tk.Frame] = []
         self._catalog_exclude_rows: list[tk.Frame] = []
+        self._posts_col_rows: list[tk.Frame] = []
         self._alive = True
         self._tick_id = None
         self._vd_ui_mode = ""
@@ -256,6 +261,10 @@ class DesktopApp(tk.Tk):
         self._align_profile_key = "__default__"
         self._align_default_mappings: list[dict] = []
         self.var_credentials = tk.StringVar()
+        self.var_sa = tk.StringVar(value="未找到服务账号")
+        self.sa_hint = tk.StringVar(value="源表和目标表都要共享给每一个账号 · 编辑者")
+        self._cred_files: list[str] = []
+        self._settings_win: tk.Toplevel | None = None
         self._tab = "filter"
         self._tick_cache: dict[str, str] = {}
         self._sa_files_shown: list[str] | None = None
@@ -273,6 +282,7 @@ class DesktopApp(tk.Tk):
                     pass
         self._build()
         self._init_menus()
+        self._load_global_credentials()
         self._sync_schedulers()
         self._tick_id = self.after(300, self._tick)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -444,19 +454,17 @@ class DesktopApp(tk.Tk):
             pady=2,
         )
         self.btn_update.pack(side="left", padx=8)
-
-        sa = tk.Frame(head, bg=C["sa"], highlightbackground="#2c5248", highlightthickness=1)
-        sa.pack(side="right", padx=18, pady=12)
-        self.sa_hint = tk.StringVar(value="源表和目标表都要共享给每一个账号 · 编辑者")
-        tk.Label(sa, textvariable=self.sa_hint, bg=C["sa"], fg="#9bb5ab", font=("Microsoft YaHei UI", 8)).pack(anchor="w", padx=10, pady=(8, 2))
-        self.var_sa = tk.StringVar(value="未找到服务账号")
-        self._cred_files: list[str] = []
-        tk.Label(sa, textvariable=self.var_sa, bg=C["sa"], fg="#e8d39a", font=FS, justify="left", wraplength=420).pack(anchor="w", padx=10)
-        sa_actions = tk.Frame(sa, bg=C["sa"])
-        sa_actions.pack(anchor="e", padx=10, pady=8)
-        StyleBtn(sa_actions, "ghost", text="+ 添加服务账号", command=self._choose_credentials, bg=C["sa"], fg=C["cream"]).pack(side="left", padx=(0, 6))
-        StyleBtn(sa_actions, "ghost", text="复制邮箱", command=self._copy_sa, bg=C["sa"], fg=C["cream"]).pack(side="left", padx=(0, 6))
-        StyleBtn(sa_actions, "ghost", text="移除末个", command=self._remove_last_credential, bg=C["sa"], fg=C["cream"]).pack(side="left")
+        self.btn_settings = StyleBtn(
+            version_row,
+            "ghost",
+            text="设置",
+            command=self._open_settings,
+            bg=C["head"],
+            fg=C["cream"],
+            padx=8,
+            pady=2,
+        )
+        self.btn_settings.pack(side="left")
 
         self.status = tk.StringVar(value="待命")
         tk.Label(
@@ -518,6 +526,7 @@ class DesktopApp(tk.Tk):
         self.btn_align = StyleBtn(actions, "ghost", text="开始对齐同步", command=self._run_align)
         self.btn_video = StyleBtn(actions, "head", text="提取视频时长", command=self._run_video)
         self.btn_catalog = StyleBtn(actions, "primary", text="开始目录汇总", command=self._run_catalog)
+        self.btn_posts = StyleBtn(actions, "primary", text="开始贴文汇总", command=self._run_posts)
         self.btn_roster = StyleBtn(actions, "primary", text="开始队别专页汇总", command=self._run_roster)
         self.btn_stop = StyleBtn(actions, "ghost", text="停止当前", command=self._stop_current)
         self.btn_run_selected = StyleBtn(actions, "head", text="执行所选", command=self._run_selected)
@@ -532,12 +541,15 @@ class DesktopApp(tk.Tk):
         self.video_page, self.video_inner = self._scroll_tab(self.pages)
         self.filter_page.place(relx=0, rely=0, relwidth=1, relheight=1)
         self.catalog_page.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self.posts_page, self.posts_inner = self._scroll_tab(self.pages)
+        self.posts_page.place(relx=0, rely=0, relwidth=1, relheight=1)
         self.align_page.place(relx=0, rely=0, relwidth=1, relheight=1)
         self.video_page.place(relx=0, rely=0, relwidth=1, relheight=1)
         self.roster_page, self.roster_inner = self._scroll_tab(self.pages)
         self.roster_page.place(relx=0, rely=0, relwidth=1, relheight=1)
         self._build_filter(self.filter_inner)
         self._build_catalog(self.catalog_inner)
+        self._build_posts(self.posts_inner)
         self._build_align(self.align_inner)
         self._build_video(self.video_inner)
         self._build_roster(self.roster_inner)
@@ -555,19 +567,22 @@ class DesktopApp(tk.Tk):
         mapping = {
             "filter": self.filter_page,
             "catalog": self.catalog_page,
+            "posts": self.posts_page,
             "align": self.align_page,
             "video": self.video_page,
             "custom": self.video_page,
             "roster": self.roster_page,
         }
         mapping.get(name, self.filter_page).lift()
-        for btn in (self.btn_run, self.btn_pub, self.btn_align, self.btn_video, self.btn_catalog, self.btn_roster, self.btn_save):
+        for btn in (self.btn_run, self.btn_pub, self.btn_align, self.btn_video, self.btn_catalog, self.btn_posts, self.btn_roster, self.btn_save):
             btn.pack_forget()
         if name == "filter":
             self.btn_run.pack(side="left", padx=(0, 8))
             self.btn_pub.pack(side="left", padx=(0, 8))
         elif name == "catalog":
             self.btn_catalog.pack(side="left", padx=(0, 8))
+        elif name == "posts":
+            self.btn_posts.pack(side="left", padx=(0, 8))
         elif name == "align":
             self.btn_align.pack(side="left", padx=(0, 8))
         elif name == "roster":
@@ -585,6 +600,7 @@ class DesktopApp(tk.Tk):
         template_names = {
             "filter": "贴文筛选汇总",
             "catalog": "目录表驱动汇总",
+            "posts": "贴文汇总",
             "align": "字段映射 / 表头对齐",
             "video": "视频提取时长",
             "custom": "自定义数据汇总",
@@ -626,6 +642,10 @@ class DesktopApp(tk.Tk):
             settings = copy.deepcopy(base)
             settings["vd_write_log"] = False
             self._menus.append({"id": "custom-default", "name": template_names["custom"], "template": "custom", "settings": settings})
+        if not any(item.get("template") == "posts" for item in self._menus):
+            settings = copy.deepcopy(base)
+            settings.update(self._posts_default_settings())
+            self._menus.append({"id": "posts-default", "name": template_names["posts"], "template": "posts", "settings": settings})
         for item in self._menus:
             item.setdefault("id", f"{item['template']}-{id(item)}")
             item.setdefault("name", template_names[item["template"]])
@@ -658,7 +678,8 @@ class DesktopApp(tk.Tk):
                 relief="flat",
                 highlightthickness=0,
             ).pack(side="left", padx=(2, 0))
-            text = f"{item['name']}\n  { {'filter':'贴文模板','catalog':'目录模板','align':'映射模板','video':'时长模板','custom':'自定义模板','roster':'专页模板'}[item['template']] }"
+            labels = {"filter": "贴文模板", "catalog": "目录模板", "posts": "贴文汇总", "align": "映射模板", "video": "时长模板", "custom": "自定义模板", "roster": "专页模板"}
+            text = f"{item['name']}\n  {labels.get(item['template'], '')}"
             btn = tk.Button(
                 wrap,
                 text=text,
@@ -748,7 +769,7 @@ class DesktopApp(tk.Tk):
         name = simpledialog.askstring("修改菜单名称", "新名称：", initialvalue=item["name"], parent=self)
         if name and name.strip():
             item["name"] = name.strip()
-            labels = {"filter": "贴文模板", "catalog": "目录模板", "align": "映射模板", "video": "时长模板", "custom": "自定义模板", "roster": "专页模板"}
+            labels = {"filter": "贴文模板", "catalog": "目录模板", "posts": "贴文汇总", "align": "映射模板", "video": "时长模板", "custom": "自定义模板", "roster": "专页模板"}
             btn = self._menu_buttons.get(menu_id)
             if btn:
                 btn.configure(text=f"{item['name']}\n  {labels.get(item['template'], '')}")
@@ -766,6 +787,7 @@ class DesktopApp(tk.Tk):
         options = (
             ("filter", "贴文筛选汇总", "按日期、点赞筛选贴文库"),
             ("catalog", "目录表驱动汇总", "按目录表列出的表格合并写入"),
+            ("posts", "贴文汇总", "按数据列表链接读取订阅表，对照贴文库后写入整合表"),
             ("align", "字段映射 / 表头对齐", "把多张表按字段对齐"),
             ("video", "视频提取时长", "读视频链接，写日志表和数据表"),
             ("custom", "自定义数据汇总", "按分类每天计数，不写日志、不算时长"),
@@ -804,8 +826,8 @@ class DesktopApp(tk.Tk):
         template = self._pick_template()
         if not template:
             return
-        labels = {"filter": "贴文筛选汇总", "catalog": "目录表驱动汇总", "align": "字段映射 / 表头对齐", "video": "视频提取时长", "custom": "自定义数据汇总"}
-        name = simpledialog.askstring("新增配置菜单", "菜单名称：", initialvalue=f"{labels[template]}副本", parent=self)
+        labels = {"filter": "贴文筛选汇总", "catalog": "目录表驱动汇总", "posts": "贴文汇总", "align": "字段映射 / 表头对齐", "video": "视频提取时长", "custom": "自定义数据汇总"}
+        name = simpledialog.askstring("新增配置菜单", "菜单名称：", initialvalue=f"{labels.get(template, template)}副本", parent=self)
         if not name or not name.strip():
             return
         source = next((item for item in self._menus if item["template"] == template), None)
@@ -814,6 +836,9 @@ class DesktopApp(tk.Tk):
             settings["vd_write_log"] = template == "video"
             settings.setdefault("vd_types", [])
             settings.setdefault("vd_report_categories", [])
+        if template == "posts":
+            for key, value in self._posts_default_settings().items():
+                settings.setdefault(key, value)
         menu_id = f"{template}-{int(datetime.now().timestamp() * 1000)}"
         self._menus.append({"id": menu_id, "name": name.strip(), "template": template, "settings": settings})
         self._render_menu_buttons()
@@ -1517,6 +1542,224 @@ class DesktopApp(tk.Tk):
         self._set_entry_rows(self._catalog_exclude_rows, self._add_catalog_exclude, items, empty=1)
         self._upd_catalog_exclude_count()
 
+    def _posts_default_settings(self) -> dict:
+        return {
+            "pa_list_url": "https://docs.google.com/spreadsheets/d/1xX8QLvuRDawx2qoKz08bC9ZjIp_rFNO1jHmCUCUoPEE/edit",
+            "pa_list_sheet": "数据列表",
+            "pa_link_col": "K",
+            "pa_tag_col": "L",
+            "pa_start_row": "2",
+            "pa_sub_sheet": "订阅",
+            "pa_source_cols": ["J", "M", "O", "A", "L", "E", "N"],
+            "pa_date_col": "M",
+            "pa_date_filter_enabled": True,
+            "pa_start_date": "2026-08-22",
+            "pa_end_date": "",
+            "pa_include_tag": True,
+            "pa_lookup_enabled": True,
+            "pa_lookup_url": "https://docs.google.com/spreadsheets/d/1_eY__L_DB-Pk74OuCuZbYNUEI1fUvT61a2kK4q-be1k/edit",
+            "pa_lookup_sheet": "当月贴文库",
+            "pa_lookup_key_col": "B",
+            "pa_lookup_value_col": "N",
+            "pa_match_col": "J",
+            "pa_write_library": True,
+            "pa_library_write_col": "B",
+            "pa_target_url": "https://docs.google.com/spreadsheets/d/1xX8QLvuRDawx2qoKz08bC9ZjIp_rFNO1jHmCUCUoPEE/edit",
+            "pa_output_sheet": "整合",
+            "pa_output_start_row": "2",
+            "pa_include_headers": False,
+            "pa_schedule_enabled": False,
+            "pa_schedule_minutes": "120",
+        }
+
+    def _posts_settings_from_ui(self) -> dict:
+        return {
+            "pa_list_url": self.var_pa_list_url.get().strip(),
+            "pa_list_sheet": self.var_pa_list_sheet.get().strip(),
+            "pa_link_col": self.var_pa_link_col.get().strip(),
+            "pa_tag_col": self.var_pa_tag_col.get().strip(),
+            "pa_start_row": self.var_pa_start_row.get().strip(),
+            "pa_sub_sheet": self.var_pa_sub_sheet.get().strip(),
+            "pa_source_cols": self._read_posts_cols(),
+            "pa_date_col": self.var_pa_date_col.get().strip(),
+            "pa_date_filter_enabled": self.var_pa_date_filter.get(),
+            "pa_start_date": self.var_pa_start.get().strip(),
+            "pa_end_date": self.var_pa_end.get().strip(),
+            "pa_include_tag": self.var_pa_include_tag.get(),
+            "pa_lookup_enabled": self.var_pa_lookup_enabled.get(),
+            "pa_lookup_url": self.var_pa_lookup_url.get().strip(),
+            "pa_lookup_sheet": self.var_pa_lookup_sheet.get().strip(),
+            "pa_lookup_key_col": self.var_pa_lookup_key.get().strip(),
+            "pa_lookup_value_col": self.var_pa_lookup_value.get().strip(),
+            "pa_match_col": self.var_pa_match_col.get().strip(),
+            "pa_write_library": self.var_pa_write_library.get(),
+            "pa_library_write_col": self.var_pa_library_write_col.get().strip(),
+            "pa_target_url": self.var_pa_target_url.get().strip(),
+            "pa_output_sheet": self.var_pa_output_sheet.get().strip(),
+            "pa_output_start_row": self.var_pa_out_start.get().strip(),
+            "pa_include_headers": self.var_pa_include_headers.get(),
+            "pa_schedule_enabled": self.var_pa_sched.get(),
+            "pa_schedule_minutes": self.var_pa_minutes.get().strip(),
+        }
+
+    def _apply_posts_settings(self, s: dict) -> None:
+        defaults = self._posts_default_settings()
+        self._set_str(self.var_pa_list_url, s.get("pa_list_url"), defaults["pa_list_url"])
+        self._set_str(self.var_pa_list_sheet, s.get("pa_list_sheet"), "数据列表")
+        self._set_str(self.var_pa_start_row, s.get("pa_start_row"), "2")
+        self._set_str(self.var_pa_link_col, s.get("pa_link_col"), "K")
+        self._set_str(self.var_pa_tag_col, s.get("pa_tag_col"), "L")
+        self._set_bool(self.var_pa_include_tag, s.get("pa_include_tag"), True)
+        self._set_str(self.var_pa_sub_sheet, s.get("pa_sub_sheet"), "订阅")
+        self._set_posts_cols(s.get("pa_source_cols") or defaults["pa_source_cols"])
+        self._set_bool(self.var_pa_date_filter, s.get("pa_date_filter_enabled"), True)
+        self._set_str(self.var_pa_date_col, s.get("pa_date_col"), "M")
+        self._set_str(self.var_pa_start, s.get("pa_start_date"), defaults["pa_start_date"])
+        self._set_str(self.var_pa_end, s.get("pa_end_date"))
+        self._set_bool(self.var_pa_lookup_enabled, s.get("pa_lookup_enabled"), True)
+        self._set_str(self.var_pa_lookup_url, s.get("pa_lookup_url"), defaults["pa_lookup_url"])
+        self._set_str(self.var_pa_lookup_sheet, s.get("pa_lookup_sheet"), "当月贴文库")
+        self._set_str(self.var_pa_lookup_key, s.get("pa_lookup_key_col"), "B")
+        self._set_str(self.var_pa_lookup_value, s.get("pa_lookup_value_col"), "N")
+        self._set_str(self.var_pa_match_col, s.get("pa_match_col"), "J")
+        self._set_bool(self.var_pa_write_library, s.get("pa_write_library"), True)
+        self._set_str(self.var_pa_library_write_col, s.get("pa_library_write_col"), "B")
+        self._set_str(self.var_pa_target_url, s.get("pa_target_url"), defaults["pa_target_url"])
+        self._set_str(self.var_pa_output_sheet, s.get("pa_output_sheet"), "整合")
+        self._set_str(self.var_pa_out_start, s.get("pa_output_start_row"), "2")
+        self._set_bool(self.var_pa_include_headers, s.get("pa_include_headers"))
+        self._set_bool(self.var_pa_sched, s.get("pa_schedule_enabled"))
+        self._set_str(self.var_pa_minutes, s.get("pa_schedule_minutes"), "120")
+
+    def _build_posts(self, p) -> None:
+        c1 = self._card(p, "1. 数据列表", "列出要汇总的订阅表链接")
+        self._note(
+            c1,
+            "主表里一列是各订阅表格链接，一列是来源标记（写入整合表）。"
+            "链接列可以是完整网址，也可以是蓝字超链接。服务账号用软件顶部配置的 JSON。",
+        )
+        self.var_pa_list_url = tk.StringVar()
+        self.var_pa_list_sheet = tk.StringVar(value="数据列表")
+        self.var_pa_start_row = tk.StringVar(value="2")
+        self.var_pa_link_col = tk.StringVar(value="K")
+        self.var_pa_tag_col = tk.StringVar(value="L")
+        self._entry(c1, "数据列表表格链接", self.var_pa_list_url)
+        g = self._row3(c1)
+        self._cell(g, 0, "工作表名", self.var_pa_list_sheet)
+        self._cell(g, 1, "数据起始行", self.var_pa_start_row)
+        g2 = self._row3(c1)
+        self._cell(g2, 0, "链接所在列", self.var_pa_link_col)
+        self._cell(g2, 1, "来源标记列", self.var_pa_tag_col)
+        self.var_pa_include_tag = tk.BooleanVar(value=True)
+        self._check(c1, "把来源标记列写入整合表（接在订阅列后面）", self.var_pa_include_tag)
+
+        c2 = self._card(p, "2. 订阅表", "每个链接打开后读取这个工作表")
+        self.var_pa_sub_sheet = tk.StringVar(value="订阅")
+        self._entry(c2, "订阅工作表名", self.var_pa_sub_sheet)
+        self._note(c2, "下面按顺序读取这些列，写入整合表 A 列起。默认 J、M、O、A、L、E、N。")
+        self.posts_col_box = tk.Frame(c2, bg=C["card"])
+        self.posts_col_box.pack(fill="x")
+        col_hint = tk.Frame(c2, bg=C["card"])
+        col_hint.pack(fill="x", pady=4)
+        self.posts_col_count = tk.Label(col_hint, text="0 列", bg=C["card"], fg=C["muted"], font=FS)
+        self.posts_col_count.pack(side="left")
+        StyleBtn(col_hint, "ghost", text="+ 添加列", command=self._add_posts_col).pack(side="right")
+        for letter in ("J", "M", "O", "A", "L", "E", "N"):
+            self._add_posts_col(letter)
+
+        c3 = self._card(p, "3. 日期筛选", "限制写入范围")
+        self._note(c3, "按订阅表里的日期列筛选。只填开始日期则从这天起（含当天）。格式 2026-08-22。")
+        self.var_pa_date_filter = tk.BooleanVar(value=True)
+        self._check(c3, "启用日期筛选", self.var_pa_date_filter)
+        g = self._row3(c3)
+        self.var_pa_date_col = tk.StringVar(value="M")
+        self.var_pa_start = tk.StringVar(value="2026-08-22")
+        self.var_pa_end = tk.StringVar()
+        self._cell(g, 0, "日期列", self.var_pa_date_col)
+        self._cell(g, 1, "开始日期", self.var_pa_start)
+        self._cell(g, 2, "结束日期", self.var_pa_end)
+
+        c4 = self._card(p, "4. 贴文库对照", "用订阅表一列去贴文库查找")
+        self.var_pa_lookup_enabled = tk.BooleanVar(value=True)
+        self._check(c4, "启用贴文库对照（结果追加在整合表最后一列）", self.var_pa_lookup_enabled)
+        self.var_pa_lookup_url = tk.StringVar()
+        self._entry(c4, "贴文库表格链接", self.var_pa_lookup_url)
+        g = self._row3(c4)
+        self.var_pa_lookup_sheet = tk.StringVar(value="当月贴文库")
+        self.var_pa_lookup_key = tk.StringVar(value="B")
+        self.var_pa_lookup_value = tk.StringVar(value="N")
+        self._cell(g, 0, "工作表名", self.var_pa_lookup_sheet)
+        self._cell(g, 1, "查找列", self.var_pa_lookup_key)
+        self._cell(g, 2, "取值列", self.var_pa_lookup_value)
+        g2 = self._row3(c4)
+        self.var_pa_match_col = tk.StringVar(value="J")
+        self.var_pa_library_write_col = tk.StringVar(value="B")
+        self._cell(g2, 0, "订阅表用来对照的列", self.var_pa_match_col)
+        self._cell(g2, 1, "写入贴文库哪一列", self.var_pa_library_write_col)
+        self.var_pa_write_library = tk.BooleanVar(value=True)
+        self._check(c4, "同时把订阅表新链接写入贴文库（按查找列排重，已有的跳过，新的从第 2 行插入）", self.var_pa_write_library)
+        self._note(c4, "整合表流程不变。默认用订阅表 J 列对照贴文库 B 列：已有的跳过，新链接从第 2 行插入，原有数据往下移。")
+
+        c5 = self._card(p, "5. 写入目标表")
+        self.var_pa_target_url = tk.StringVar()
+        self._entry(c5, "目标表格链接（留空则写入数据列表同一张表）", self.var_pa_target_url)
+        g = self._row3(c5)
+        self.var_pa_output_sheet = tk.StringVar(value="整合")
+        self.var_pa_out_start = tk.StringVar(value="2")
+        self._cell(g, 0, "工作表名", self.var_pa_output_sheet)
+        self._cell(g, 1, "写入起始行", self.var_pa_out_start)
+        self.var_pa_include_headers = tk.BooleanVar(value=False)
+        self._check(c5, "写入表头（默认不写，从第 2 行起覆盖 A 列往后）", self.var_pa_include_headers)
+
+        c6 = self._card(p, "6. 定时汇总", "关掉窗口就不再跑")
+        self._note(c6, "原脚本每 2 小时跑一次。可改成自己的分钟数。")
+        g = self._row3(c6)
+        self.var_pa_minutes = tk.StringVar(value="120")
+        self._cell(g, 0, "间隔（分钟）", self.var_pa_minutes)
+        self.var_pa_sched = tk.BooleanVar(value=False)
+        self._check(c6, "启用贴文汇总定时", self.var_pa_sched)
+        self.posts_sched_info = tk.Label(c6, text="定时未启动", bg=C["card"], fg=C["muted"], font=FS)
+        self.posts_sched_info.pack(anchor="w", pady=4)
+
+    def _add_posts_col(self, value: str = "") -> None:
+        row = tk.Frame(self.posts_col_box, bg=C["card"])
+        row.pack(fill="x", pady=3)
+        e = tk.Entry(row, font=MONO, relief="solid", bd=1, width=8)
+        e.insert(0, value)
+        e.pack(side="left", ipady=4)
+        StyleBtn(row, "ghost", text="删除", command=lambda: self._del_posts_col(row)).pack(side="left", padx=(6, 0))
+        row._val = e
+        e.bind("<KeyRelease>", lambda _e: self._upd_posts_col_count())
+        self._posts_col_rows.append(row)
+        self._upd_posts_col_count()
+
+    def _del_posts_col(self, row) -> None:
+        if row in self._posts_col_rows:
+            self._posts_col_rows.remove(row)
+        row.destroy()
+        if not self._posts_col_rows:
+            self._add_posts_col()
+        self._upd_posts_col_count()
+
+    def _upd_posts_col_count(self) -> None:
+        n = sum(1 for r in self._posts_col_rows if r._val.get().strip())
+        if hasattr(self, "posts_col_count"):
+            self.posts_col_count.configure(text=f"{n} 列")
+
+    def _read_posts_cols(self) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for row in self._posts_col_rows:
+            text = row._val.get().strip().upper()
+            if text and text not in seen:
+                seen.add(text)
+                out.append(text)
+        return out
+
+    def _set_posts_cols(self, items) -> None:
+        self._set_entry_rows(self._posts_col_rows, self._add_posts_col, items or ["J", "M", "O", "A", "L", "E", "N"], empty=1)
+        self._upd_posts_col_count()
+
     def _build_align(self, p) -> None:
         c1 = self._card(p, "1. 数据源表格链接", collapsed=True)
         self._note(c1, "每行填一个数据源。工作表名称填源表里的 sheet 名（如 8月份）；留空则读第一个工作表。")
@@ -1935,24 +2178,176 @@ class DesktopApp(tk.Tk):
         self.log.insert("end", "软件已启动。左侧可切换、重命名或新增配置菜单；改完点保存。\n")
         self.log.configure(state="disabled")
 
+    def _sa_emails(self) -> list[str]:
+        emails: list[str] = []
+        for path in self._cred_files or []:
+            emails.append(service_account_email(Path(path)) or Path(path).name)
+        return emails
+
     def _copy_sa(self):
+        text = ""
+        box = getattr(self, "_settings_list", None)
+        if box is not None:
+            try:
+                sel = box.curselection()
+                if sel:
+                    text = str(box.get(sel[0]) or "")
+                    if ". " in text:
+                        text = text.split(". ", 1)[-1]
+            except Exception:
+                text = ""
+        if not text:
+            text = self.var_sa.get()
+        if not text or text in ("未找到服务账号", "还没有服务账号，请点击「添加服务账号」"):
+            return
         self.clipboard_clear()
-        self.clipboard_append(self.var_sa.get())
+        self.clipboard_append(text)
         self._append_log("已复制服务账号邮箱")
 
     def _refresh_sa_display(self) -> None:
-        files = [str(p).strip() for p in (self._cred_files or []) if str(p).strip()]
+        files = normalize_credential_paths(self._cred_files)
         self._cred_files = files
         self._sa_files_shown = list(files)
         self.var_credentials.set(files[0] if files else "")
-        emails: list[str] = []
-        for path in files:
-            emails.append(service_account_email(Path(path)) or Path(path).name)
+        emails = self._sa_emails()
         self.var_sa.set("\n".join(emails) if emails else "未找到服务账号")
         if len(files) > 1:
             self.sa_hint.set(f"{len(files)} 个服务账号轮询 · 每个都要共享编辑者")
         else:
             self.sa_hint.set("源表和目标表都要共享给它 · 编辑者")
+        self._refresh_settings_list(emails)
+
+    def _refresh_settings_list(self, emails: list[str] | None = None) -> None:
+        box = getattr(self, "_settings_list", None)
+        if box is None:
+            return
+        try:
+            if not box.winfo_exists():
+                return
+        except Exception:
+            return
+        if emails is None:
+            emails = self._sa_emails()
+        box.delete(0, "end")
+        if emails:
+            for index, email in enumerate(emails, 1):
+                box.insert("end", f"{index}. {email}")
+        else:
+            box.insert("end", "还没有服务账号，请点击「添加服务账号」")
+
+    def _load_global_credentials(self) -> None:
+        files = discover_credential_files(self.cfg, self._menus)
+        self._cred_files = files
+        self._refresh_sa_display()
+        top = discover_credential_files(self.cfg, None, include_copied=False)
+        if files and files != top:
+            self._persist_credentials()
+
+    def _apply_creds_to_cfg(self, cfg):
+        files = list(self._cred_files or [])
+        if files:
+            cfg.credentials_files = files
+            cfg.credentials_file = files[0]
+        return cfg
+
+    def _persist_credentials(self) -> None:
+        files = list(self._cred_files or [])
+        first = files[0] if files else ""
+        for item in self._menus:
+            settings = item.setdefault("settings", {})
+            settings["credentials_files"] = list(files)
+            settings["credentials_file"] = first
+        try:
+            cfg = load_config()
+            cfg.credentials_files = list(files)
+            cfg.credentials_file = first
+            for item in cfg.ui_menus or []:
+                if not isinstance(item, dict):
+                    continue
+                settings = item.setdefault("settings", {})
+                if isinstance(settings, dict):
+                    settings["credentials_files"] = list(files)
+                    settings["credentials_file"] = first
+            save_config(cfg)
+            self.cfg.credentials_files = list(files)
+            self.cfg.credentials_file = first
+            if getattr(self.cfg, "ui_menus", None):
+                self.cfg.ui_menus = cfg.ui_menus
+        except Exception as exc:
+            self._append_log(f"保存服务账号失败：{exc}")
+
+    def _open_settings(self) -> None:
+        existing = getattr(self, "_settings_win", None)
+        if existing is not None:
+            try:
+                if existing.winfo_exists():
+                    existing.deiconify()
+                    existing.lift()
+                    existing.focus_force()
+                    self._refresh_settings_list()
+                    return
+            except Exception:
+                pass
+        win = tk.Toplevel(self)
+        win.title("设置")
+        win.configure(bg=C["paper"])
+        win.transient(self)
+        win.minsize(560, 420)
+        win.geometry(f"620x480+{self.winfo_rootx() + 80}+{self.winfo_rooty() + 60}")
+        self._settings_win = win
+
+        head = tk.Frame(win, bg=C["head"])
+        head.pack(fill="x")
+        tk.Label(head, text="设置", bg=C["head"], fg=C["cream"], font=FH).pack(anchor="w", padx=18, pady=(14, 2))
+        tk.Label(
+            head,
+            text="服务账号对所有模板共用。添加后会立即保存，下次启动仍会显示。",
+            bg=C["head"],
+            fg="#c9d5cc",
+            font=FS,
+        ).pack(anchor="w", padx=18, pady=(0, 12))
+
+        card = tk.Frame(win, bg=C["card"], highlightbackground=C["line"], highlightthickness=1)
+        card.pack(fill="both", expand=True, padx=16, pady=16)
+        tk.Label(card, text="服务账号", bg=C["card"], fg=C["ink"], font=FB).pack(anchor="w", padx=14, pady=(12, 4))
+        tk.Label(card, textvariable=self.sa_hint, bg=C["card"], fg=C["muted"], font=FS, wraplength=540, justify="left").pack(
+            anchor="w", padx=14, pady=(0, 8)
+        )
+        list_wrap = tk.Frame(card, bg=C["card"])
+        list_wrap.pack(fill="both", expand=True, padx=14)
+        box = tk.Listbox(
+            list_wrap,
+            font=MONO,
+            relief="solid",
+            bd=1,
+            activestyle="dotbox",
+            selectmode="browse",
+            bg="#f8fffd",
+            fg=C["ink"],
+            highlightthickness=0,
+        )
+        bar = ttk.Scrollbar(list_wrap, orient="vertical", command=box.yview)
+        box.configure(yscrollcommand=bar.set)
+        box.pack(side="left", fill="both", expand=True)
+        bar.pack(side="right", fill="y")
+        self._settings_list = box
+        self._refresh_settings_list()
+
+        def _on_close_settings():
+            self._settings_win = None
+            self._settings_list = None
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        actions = tk.Frame(card, bg=C["card"])
+        actions.pack(fill="x", padx=14, pady=12)
+        StyleBtn(actions, "ghost", text="+ 添加服务账号", command=self._choose_credentials).pack(side="left", padx=(0, 6))
+        StyleBtn(actions, "ghost", text="复制邮箱", command=self._copy_sa).pack(side="left", padx=(0, 6))
+        StyleBtn(actions, "ghost", text="移除末个", command=self._remove_last_credential).pack(side="left")
+        StyleBtn(actions, "ghost", text="关闭", command=_on_close_settings).pack(side="right")
+        win.protocol("WM_DELETE_WINDOW", _on_close_settings)
 
     def _remove_last_credential(self) -> None:
         if len(self._cred_files) <= 1:
@@ -1960,6 +2355,7 @@ class DesktopApp(tk.Tk):
             return
         removed = self._cred_files.pop()
         self._refresh_sa_display()
+        self._persist_credentials()
         self._append_log(f"已移除服务账号：{Path(removed).name}")
 
     def _choose_credentials(self) -> None:
@@ -1969,10 +2365,12 @@ class DesktopApp(tk.Tk):
             title="选择 Google 服务账号 JSON（可多选）",
             initialdir=str(initial),
             filetypes=(("JSON 文件", "*.json"), ("所有文件", "*.*")),
+            parent=self._settings_win if getattr(self, "_settings_win", None) else self,
         )
         if not selected:
             return
         added = []
+        existing = {str(Path(p).resolve()) for p in self._cred_files if Path(p).exists()}
         for item in selected:
             src = Path(item)
             email = service_account_email(src)
@@ -1983,13 +2381,16 @@ class DesktopApp(tk.Tk):
             dest = SCRIPT_DIR / f"credentials-{slug}.json"
             try:
                 shutil.copy2(src, dest)
-                stored = str(dest)
+                stored = str(dest.resolve())
             except Exception:
                 stored = str(src)
-            if stored not in self._cred_files:
+            key = str(Path(stored).resolve()) if Path(stored).exists() else stored
+            if key not in existing and stored not in self._cred_files:
                 self._cred_files.append(stored)
+                existing.add(key)
                 added.append(email)
         self._refresh_sa_display()
+        self._persist_credentials()
         if added:
             self._append_log("已添加服务账号：" + "、".join(added) + "。额度满了会自动换下一个，不必长时间等待。")
 
@@ -2188,6 +2589,11 @@ class DesktopApp(tk.Tk):
                 "catalog_schedule_enabled": self.var_catalog_sched.get(),
                 "catalog_schedule_minutes": self.var_catalog_minutes.get().strip(),
             }
+        if template == "posts":
+            return {
+                **shared,
+                **self._posts_settings_from_ui(),
+            }
         if template == "align":
             self._save_align_profile()
             return {
@@ -2311,6 +2717,9 @@ class DesktopApp(tk.Tk):
             self._set_bool(self.var_catalog_sched, s.get("catalog_schedule_enabled"))
             self._set_str(self.var_catalog_minutes, s.get("catalog_schedule_minutes"), "180")
             self._set_catalog_exclude(s.get("catalog_exclude_sheets") or [])
+            return
+        if template == "posts":
+            self._apply_posts_settings(s)
             return
         if template == "align":
             self._set_str(self.var_align_source_sheet, s.get("align_source_sheet"))
@@ -2476,6 +2885,7 @@ class DesktopApp(tk.Tk):
             "catalog_exclude_sheets": self._read_catalog_exclude(),
             "catalog_schedule_enabled": self.var_catalog_sched.get(),
             "catalog_schedule_minutes": self.var_catalog_minutes.get().strip(),
+            **self._posts_settings_from_ui(),
             "include_headers": self.var_include_headers.get(),
             "hot_include_headers": self.var_hot_include_headers.get(),
             "add_source_column": self.var_add_source_column.get(),
@@ -2564,13 +2974,12 @@ class DesktopApp(tk.Tk):
         self.var_minutes.set(str(cfg.schedule_minutes or 1440))
         self.var_sched.set(bool(cfg.schedule_enabled))
         self.var_changed.set(bool(cfg.schedule_only_if_changed))
-        creds = [str(x).strip() for x in (getattr(cfg, "credentials_files", None) or []) if str(x).strip()]
-        if cfg.credentials_file and cfg.credentials_file not in creds:
-            creds.insert(0, cfg.credentials_file)
-        self._cred_files = creds
-        self.var_credentials.set(creds[0] if creds else "")
-        if creds != self._sa_files_shown:
-            self._refresh_sa_display()
+        creds = discover_credential_files(cfg, getattr(cfg, "ui_menus", None), include_copied=False)
+        if creds:
+            self._cred_files = creds
+            self.var_credentials.set(creds[0])
+            if creds != self._sa_files_shown:
+                self._refresh_sa_display()
         self.var_exclude.set(cfg.exclude_id_value or "未找到")
         self.var_date_field.set(cfg.date_field or "发布日期")
         self.var_sort_field.set(cfg.sort_field or "点赞")
@@ -2603,6 +3012,37 @@ class DesktopApp(tk.Tk):
             self._set_catalog_exclude(getattr(cfg, "catalog_exclude_sheets", None) or [])
         self.var_catalog_sched.set(bool(getattr(cfg, "catalog_schedule_enabled", False)))
         self.var_catalog_minutes.set(str(getattr(cfg, "catalog_schedule_minutes", 180) or 180))
+        if hasattr(self, "var_pa_list_url"):
+            self._apply_posts_settings(
+                {
+                    "pa_list_url": getattr(cfg, "pa_list_url", ""),
+                    "pa_list_sheet": getattr(cfg, "pa_list_sheet", "数据列表"),
+                    "pa_start_row": getattr(cfg, "pa_start_row", 2),
+                    "pa_link_col": getattr(cfg, "pa_link_col", "K"),
+                    "pa_tag_col": getattr(cfg, "pa_tag_col", "L"),
+                    "pa_include_tag": getattr(cfg, "pa_include_tag", True),
+                    "pa_sub_sheet": getattr(cfg, "pa_sub_sheet", "订阅"),
+                    "pa_source_cols": getattr(cfg, "pa_source_cols", None),
+                    "pa_date_filter_enabled": getattr(cfg, "pa_date_filter_enabled", True),
+                    "pa_date_col": getattr(cfg, "pa_date_col", "M"),
+                    "pa_start_date": getattr(cfg, "pa_start_date", ""),
+                    "pa_end_date": getattr(cfg, "pa_end_date", ""),
+                    "pa_lookup_enabled": getattr(cfg, "pa_lookup_enabled", True),
+                    "pa_lookup_url": getattr(cfg, "pa_lookup_url", ""),
+                    "pa_lookup_sheet": getattr(cfg, "pa_lookup_sheet", "当月贴文库"),
+                    "pa_lookup_key_col": getattr(cfg, "pa_lookup_key_col", "B"),
+                    "pa_lookup_value_col": getattr(cfg, "pa_lookup_value_col", "N"),
+                    "pa_match_col": getattr(cfg, "pa_match_col", "J"),
+                    "pa_write_library": getattr(cfg, "pa_write_library", True),
+                    "pa_library_write_col": getattr(cfg, "pa_library_write_col", "B"),
+                    "pa_target_url": getattr(cfg, "pa_target_url", ""),
+                    "pa_output_sheet": getattr(cfg, "pa_output_sheet", "整合"),
+                    "pa_output_start_row": getattr(cfg, "pa_output_start_row", 2),
+                    "pa_include_headers": getattr(cfg, "pa_include_headers", False),
+                    "pa_schedule_enabled": getattr(cfg, "pa_schedule_enabled", False),
+                    "pa_schedule_minutes": getattr(cfg, "pa_schedule_minutes", 120),
+                }
+            )
         self.var_vd_source_url.set(getattr(cfg, "vd_source_url", "") or "")
         source_sheets = getattr(cfg, "vd_source_sheets", None) or []
         self.var_vd_source_sheet.set(", ".join(source_sheets) if source_sheets else (getattr(cfg, "vd_source_sheet", "") or ""))
@@ -2701,6 +3141,14 @@ class DesktopApp(tk.Tk):
                 save_config(cfg)
                 if not quiet:
                     messagebox.showwarning("数据汇总工具", "目录汇总定时需要先填写目录表和目标表链接")
+        if current_template == "posts" and self.var_pa_sched.get():
+            if not self.var_pa_list_url.get().strip():
+                self.var_pa_sched.set(False)
+                current["settings"]["pa_schedule_enabled"] = False
+                cfg.pa_schedule_enabled = False
+                save_config(cfg)
+                if not quiet:
+                    messagebox.showwarning("数据汇总工具", "贴文汇总定时需要先填写数据列表表格链接")
         self._sync_schedulers()
         if not quiet:
             self._append_log("已保存配置，各菜单的定时会按各自间隔执行")
@@ -2717,9 +3165,7 @@ class DesktopApp(tk.Tk):
         cfg = _cfg_from_payload(settings, base=Config())
         cfg.ui_menus = copy.deepcopy(self._menus)
         cfg.ui_active_menu = self._active_menu_id
-        if self._cred_files:
-            cfg.credentials_files = list(self._cred_files)
-            cfg.credentials_file = self._cred_files[0]
+        self._apply_creds_to_cfg(cfg)
         return cfg
 
     def _run_now(self) -> None:
@@ -2750,6 +3196,16 @@ class DesktopApp(tk.Tk):
             return
         self._log_n = 0
         self._append_log("目录汇总已加入队列")
+        self._set_badge("排队中", C["accent"])
+
+    def _run_posts(self) -> None:
+        cfg = self._cfg_for_action()
+        err = start_posts_job(cfg)
+        if err:
+            messagebox.showwarning("数据汇总工具", err)
+            return
+        self._log_n = 0
+        self._append_log("贴文汇总已加入队列")
         self._set_badge("排队中", C["accent"])
 
     def _run_roster(self) -> None:
@@ -2793,6 +3249,7 @@ class DesktopApp(tk.Tk):
         starters = {
             "filter": start_filter_job,
             "catalog": start_catalog_job,
+            "posts": start_posts_job,
             "align": start_align_job,
             "video": start_video_job,
             "custom": start_video_job,
@@ -2807,6 +3264,7 @@ class DesktopApp(tk.Tk):
             cfg = _cfg_from_payload(settings, base=Config())
             cfg.ui_active_menu = item["id"]
             cfg.ui_menus = self._menus
+            self._apply_creds_to_cfg(cfg)
             fn = starters.get(item["template"])
             if not fn:
                 continue
@@ -2856,6 +3314,21 @@ class DesktopApp(tk.Tk):
         finished = job.get("finished_at") or ""
         prefix = f"已完成 {finished}  " if finished else "已完成  "
         mode = result.get("mode")
+        if mode == "posts":
+            added = int(result.get("total_rows") or 0)
+            ok_sheets = int(result.get("ok_sheets") or 0)
+            failed = int(result.get("failed_sheets") or 0)
+            date_skip = int(result.get("date_skipped") or 0)
+            library_added = int(result.get("library_added") or 0)
+            library_skipped = int(result.get("library_skipped") or 0)
+            parts = [f"整合表 {added} 行", f"贴文库新增 {library_added} 行", f"成功 {ok_sheets} 个订阅表"]
+            if library_skipped:
+                parts.append(f"贴文库已有跳过 {library_skipped}")
+            if failed:
+                parts.append(f"失败 {failed}")
+            if date_skip:
+                parts.append(f"日期外 {date_skip}")
+            return prefix + "，".join(parts)
         if mode == "catalog":
             added = int(result.get("total_rows") or 0)
             existing = int(result.get("existing_rows") or 0)
@@ -2937,6 +3410,7 @@ class DesktopApp(tk.Tk):
             asnap = _align_schedule_snapshot()
             vsnap = _video_schedule_snapshot()
             csnap = _catalog_schedule_snapshot()
+            psnap = _posts_schedule_snapshot()
             tab = getattr(self, "_tab", "")
             current_snap = mine if mine.get("enabled") else {
                 "filter": snap,
@@ -2944,6 +3418,7 @@ class DesktopApp(tk.Tk):
                 "video": vsnap,
                 "custom": vsnap,
                 "catalog": csnap,
+                "posts": psnap,
             }.get(tab, snap)
             nxt = current_snap.get("next_run") or ""
             if running:
@@ -2972,6 +3447,7 @@ class DesktopApp(tk.Tk):
             self._set_sched_label("align_sched_info", asnap)
             self._set_sched_label("vd_sched_info", mine if tab in ("video", "custom") else vsnap)
             self._set_sched_label("catalog_sched_info", mine if tab == "catalog" else csnap)
+            self._set_sched_label("posts_sched_info", mine if tab == "posts" else psnap)
         except Exception as exc:
             try:
                 write_app_log(f"界面刷新失败: {exc}")
@@ -2997,6 +3473,10 @@ class DesktopApp(tk.Tk):
         widget.configure(text=text)
 
     def _on_close(self) -> None:
+        try:
+            self._persist_credentials()
+        except Exception:
+            pass
         self._alive = False
         try:
             write_app_log("窗口关闭")

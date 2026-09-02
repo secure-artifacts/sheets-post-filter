@@ -56,6 +56,7 @@ a = Analysis(
         "tkinter.messagebox",
         "video_duration",
         "catalog_merge",
+        "post_aggregate",
         "roster_fill",
     ],
     hookspath=[],

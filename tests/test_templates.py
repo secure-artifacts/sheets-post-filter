@@ -112,6 +112,18 @@ class TemplateConfigTests(unittest.TestCase):
         self.assertTrue(cfg.vd_schedule_enabled)
         self.assertEqual(cfg.vd_source_url, "https://example.com/src")
         self.assertEqual(cfg.vd_types, ["wsp"])
+        cfg_posts = app._cfg_from_payload(
+            {
+                "pa_list_url": "https://example.com/list",
+                "pa_source_cols": ["J", "M"],
+                "pa_include_tag": False,
+                "pa_lookup_enabled": True,
+            },
+            base=app.Config(),
+        )
+        self.assertEqual(cfg_posts.pa_list_url, "https://example.com/list")
+        self.assertEqual(cfg_posts.pa_source_cols, ["J", "M"])
+        self.assertFalse(cfg_posts.pa_include_tag)
         cfg_rules = app._cfg_from_payload(
             {
                 "vd_types": [

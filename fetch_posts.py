@@ -358,6 +358,33 @@ class Config:
     catalog_exclude_sheets: list[str] = field(default_factory=list)
     catalog_schedule_enabled: bool = False
     catalog_schedule_minutes: int = 180
+    # 贴文汇总：数据列表 K 列链接 → 各表「订阅」→ 对照贴文库后写入整合表
+    pa_list_url: str = ""
+    pa_list_sheet: str = "数据列表"
+    pa_link_col: str = "K"
+    pa_tag_col: str = "L"
+    pa_start_row: int = 2
+    pa_sub_sheet: str = "订阅"
+    pa_source_cols: list[str] = field(default_factory=lambda: ["J", "M", "O", "A", "L", "E", "N"])
+    pa_date_col: str = "M"
+    pa_date_filter_enabled: bool = True
+    pa_start_date: str = ""
+    pa_end_date: str = ""
+    pa_include_tag: bool = True
+    pa_lookup_enabled: bool = True
+    pa_lookup_url: str = ""
+    pa_lookup_sheet: str = "当月贴文库"
+    pa_lookup_key_col: str = "B"
+    pa_lookup_value_col: str = "N"
+    pa_match_col: str = "J"
+    pa_write_library: bool = True
+    pa_library_write_col: str = "B"
+    pa_target_url: str = ""
+    pa_output_sheet: str = "整合"
+    pa_output_start_row: int = 2
+    pa_include_headers: bool = False
+    pa_schedule_enabled: bool = False
+    pa_schedule_minutes: int = 120
     # 队别专页 / 引流对照：配置表字段映射后，按队别分 sheet 写入。
     roster_config_url: str = ""
     roster_config_sheet: str = ""
@@ -417,7 +444,7 @@ class Config:
                 return p
         raise FileNotFoundError(
             "找不到服务账号 credentials.json。\n"
-            "请在软件顶部点击「选择服务账号」，从电脑中选择 JSON 文件。"
+            "请在软件顶部点击「设置」，添加 Google 服务账号 JSON 文件。"
         )
 
 
@@ -446,6 +473,14 @@ def load_config(path: Path | None = None) -> Config:
 
 def save_config(cfg: Config, path: Path | None = None) -> Path:
     path = path or (SCRIPT_DIR / "config.json")
+    files = normalize_credential_paths(
+        [getattr(cfg, "credentials_file", "")] + list(getattr(cfg, "credentials_files", None) or [])
+    )
+    if not files:
+        files = discover_credential_files(cfg, getattr(cfg, "ui_menus", None), include_copied=False)
+    if files:
+        cfg.credentials_files = files
+        cfg.credentials_file = files[0]
     with _CONFIG_WRITE_LOCK:
         path.write_text(
             json.dumps(config_to_dict(cfg), ensure_ascii=False, indent=2),
@@ -460,6 +495,85 @@ def service_account_email(cred_path: Path) -> str:
         return str(data.get("client_email") or "")
     except Exception:
         return ""
+
+
+def normalize_credential_paths(paths) -> list[str]:
+    """Keep existing service-account JSON paths, resolved and de-duplicated."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in paths or []:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        path = Path(text)
+        if not path.is_absolute():
+            path = SCRIPT_DIR / path
+        try:
+            if not path.exists() or not path.is_file():
+                continue
+            key = str(path.resolve())
+        except Exception:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+def copied_credential_paths() -> list[Path]:
+    """Service-account JSON files copied next to the app (credentials.json / credentials-*.json)."""
+    out: list[Path] = []
+    try:
+        candidates = sorted(SCRIPT_DIR.glob("credentials*.json"))
+    except Exception:
+        return out
+    for path in candidates:
+        name = path.name.lower()
+        if name != "credentials.json" and not name.startswith("credentials-"):
+            continue
+        if not service_account_email(path):
+            continue
+        out.append(path)
+    return out
+
+
+def _credential_candidates(cfg=None, menus=None) -> list[str]:
+    raw: list[str] = []
+    if cfg is not None:
+        if getattr(cfg, "credentials_file", ""):
+            raw.append(str(cfg.credentials_file))
+        for item in getattr(cfg, "credentials_files", None) or []:
+            raw.append(str(item))
+    for menu in menus or []:
+        if not isinstance(menu, dict):
+            continue
+        settings = menu.get("settings") or {}
+        if not isinstance(settings, dict):
+            continue
+        if settings.get("credentials_file"):
+            raw.append(str(settings.get("credentials_file")))
+        for item in settings.get("credentials_files") or []:
+            raw.append(str(item))
+    return raw
+
+
+def discover_credential_files(cfg=None, menus=None, *, include_copied: bool | None = None) -> list[str]:
+    """Global service-account list.
+
+    Top-level config is the source of truth once saved. If it is empty (the
+    old per-menu bug), recover from menu settings and, unless include_copied
+    is False, from credentials*.json files next to the app.
+    """
+    top = normalize_credential_paths(_credential_candidates(cfg, None))
+    saved = normalize_credential_paths(_credential_candidates(cfg, menus))
+    use_copied = include_copied if include_copied is not None else (not top)
+    if top and not use_copied:
+        return top
+    if use_copied:
+        copied = normalize_credential_paths(str(path) for path in copied_credential_paths())
+        return normalize_credential_paths(list(saved) + list(copied))
+    return saved or top
 
 
 # ---------------------------------------------------------------------------
